@@ -1,0 +1,434 @@
+You already have the right building blocks; the upgrade is to make **socket connections** the only source of truth for “online,” and to stop using the `/messaging/online` and `/messaging/offline` endpoints for presence.[1][2]
+
+Below is **everything to copy/paste** to Replit to implement this cleanly and end‑to‑end.
+
+***
+
+## 1. Backend presence model (server/messaging.ts)
+
+Your existing `server/messaging.ts` already has an `onlineUsersCache` and timeout logic. Replace the **presence‑related parts only** with this version.[1]
+
+### 1.1 Replace the top of `server/messaging.ts` (presence + types)
+
+Find `onlineUsersCache`, `ONLINETIMEOUT`, and related types, and overwrite that region with:
+
+```ts
+// server/messaging.ts
+import { v4 as uuid } from "uuid";
+import fs from "fs";
+import path from "path";
+import cron from "node-cron";
+
+// --- Presence model driven by sockets, not HTTP ---
+
+const DATADIR = path.join(process.cwd(), "data", "messaging");
+const CONVERSATIONSFILE = path.join(DATADIR, "conversations.json");
+const MESSAGESFILE = path.join(DATADIR, "messages.json");
+
+// Socket-driven presence cache
+const onlineUsersCache = new Map<
+  string,
+  { lastSeen: number; socketCount: number }
+>();
+
+// How long without a socket ping before we consider stale and clean cache (ms)
+const ONLINETIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+const SAVEINTERVAL = 60000;
+
+export interface UserPresenceInfo {
+  userId: string;
+  isOnline: boolean;
+  lastActive: Date;
+  status: "online" | "away" | "offline";
+}
+
+export interface ConversationMeta {
+  id: string;
+  participant1Id: string;
+  participant2Id: string;
+  createdAt: string;
+  updatedAt: string;
+  lastMessagePreview?: string;
+}
+
+export interface MessageRecord {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  content: string;
+  createdAt: string;
+  read: boolean;
+}
+
+interface ConversationsData {
+  [id: string]: ConversationMeta;
+}
+
+interface MessagesData {
+  [conversationId: string]: MessageRecord[];
+}
+
+let conversationsCache: ConversationsData = {};
+let messagesCache: MessagesData = {};
+let isDirty = false;
+let isInitialized = false;
+
+function ensureDataDir(): void {
+  if (!fs.existsSync(DATADIR)) fs.mkdirSync(DATADIR, { recursive: true });
+}
+```
+
+### 1.2 Replace presence helpers (`setUserOnline`, `setUserOffline`, `getOnlineUsers`)
+
+In the same file, find and **overwrite** these three functions with:
+
+```ts
+// --- Presence helpers (socket-driven) ---
+
+export async function setUserOnline(userId: string): Promise<void> {
+  const now = Date.now();
+  const current = onlineUsersCache.get(userId) ?? {
+    lastSeen: now,
+    socketCount: 0,
+  };
+  onlineUsersCache.set(userId, {
+    lastSeen: now,
+    socketCount: current.socketCount + 1,
+  });
+}
+
+export async function setUserOffline(userId: string): Promise<void> {
+  const current = onlineUsersCache.get(userId);
+  if (!current) return;
+
+  const nextCount = current.socketCount - 1;
+  if (nextCount <= 0) {
+    onlineUsersCache.delete(userId);
+  } else {
+    onlineUsersCache.set(userId, {
+      lastSeen: Date.now(),
+      socketCount: nextCount,
+    });
+  }
+}
+
+export async function getOnlineUsers(
+  requestingUserId: string
+): Promise<{ userId: string; username: string }[]> {
+  const now = Date.now();
+  const result: { userId: string; username: string }[] = [];
+
+  for (const [userId, data] of onlineUsersCache.entries()) {
+    // Clean stale entries
+    if (now - data.lastSeen > ONLINETIMEOUT) {
+      onlineUsersCache.delete(userId);
+      continue;
+    }
+    if (userId !== requestingUserId) {
+      result.push({ userId, username: userId });
+    }
+  }
+
+  return result;
+}
+```
+
+This makes “online” depend only on active sockets, not HTTP hits.[1]
+
+---
+
+## 2. WebSocket server – connect presence to sockets
+
+You already have `server/websocket-server.ts` that initializes a Socket.io server and is used by your main `server/index.ts`. Add presence wiring there.[1]
+
+### 2.1 Update `server/websocket-server.ts`
+
+In `server/websocket-server.ts`, import the presence helpers:
+
+```ts
+// server/websocket-server.ts
+import { Server as HttpServer } from "http";
+import { Server, Socket } from "socket.io";
+import { ServiceLocator } from "./services/service-locator";
+import { setUserOnline, setUserOffline } from "./messaging";
+```
+
+Then, in `initializeWebSocketServer`, **augment the `io.on("connection")` handler**. Find:
+
+```ts
+io.on("connection", (socket: Socket) => {
+  console.log("WebSocket Client connected", socket.id);
+
+  socket.on("subscribe:bulk", (operationId: string) => {
+    // ...
+  });
+
+  // ...other subscribe/unsubscribe handlers...
+
+  socket.on("disconnect", () => {
+    console.log("WebSocket Client disconnected", socket.id);
+  });
+});
+```
+
+Replace it with:
+
+```ts
+io.on("connection", (socket: Socket) => {
+  console.log("WebSocket Client connected", socket.id);
+
+  // Expect userId either as a query param or from auth handshake
+  const userId =
+    (socket.handshake.query.userId as string) ||
+    (socket.handshake.auth && (socket.handshake.auth as any).userId);
+
+  if (userId) {
+    setUserOnline(userId).catch((err) =>
+      console.error("[presence] setUserOnline error", err)
+    );
+    console.log("[presence] user online via socket:", userId);
+    socket.data.userId = userId;
+  } else {
+    console.warn(
+      "[presence] socket connected without userId; presence not updated"
+    );
+  }
+
+  // Existing room subscriptions...
+  socket.on("subscribe:bulk", (operationId: string) => {
+    socket.join(`bulk:${operationId}`);
+    console.log("WebSocket", socket.id, "subscribed to", `bulk:${operationId}`);
+  });
+
+  socket.on("subscribe:scrub", (userIdSub: string) => {
+    socket.join(`scrub:${userIdSub}`);
+    console.log("WebSocket", socket.id, "subscribed to", `scrub:${userIdSub}`);
+  });
+
+  socket.on("subscribe:lifecycle", () => {
+    socket.join("lifecycle");
+    console.log("WebSocket", socket.id, "subscribed to lifecycle");
+  });
+
+  socket.on("subscribe:job", (jobId: string) => {
+    socket.join(`job:${jobId}`);
+    console.log("WebSocket", socket.id, "subscribed to", `job:${jobId}`);
+  });
+
+  socket.on("subscribe:printer", (printerId: string) => {
+    socket.join(`printer:${printerId}`);
+    console.log("WebSocket", socket.id, "subscribed to", `printer:${printerId}`);
+  });
+
+  socket.on("subscribe:queue", (queueName: string) => {
+    socket.join(`queue:${queueName}`);
+    console.log("WebSocket", socket.id, "subscribed to", `queue:${queueName}`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("WebSocket Client disconnected", socket.id);
+    const uid = socket.data.userId as string | undefined;
+    if (uid) {
+      setUserOffline(uid).catch((err) =>
+        console.error("[presence] setUserOffline error", err)
+      );
+      console.log("[presence] user offline via socket:", uid);
+    }
+  });
+});
+```
+
+Now, any authenticated socket counts towards presence; when the last socket for a user disconnects, they are offline.[1]
+
+---
+
+## 3. Messaging routes – stop using HTTP “online/offline”
+
+Finally, adjust `server/routes/messaging.ts` so `/messaging/online` and `/messaging/offline` **no longer control presence** and cannot conflict.[2][1]
+
+### 3.1 `server/routes/messaging.ts` (replace file)
+
+Overwrite the file with this version:
+
+```ts
+// server/routes/messaging.ts
+import express from "express";
+import {
+  getOnlineUsers,
+  getOrCreateConversation,
+  sendMessage,
+  getConversationMessages,
+  getUserConversations,
+  markMessagesRead,
+} from "../messaging";
+
+const router = express.Router();
+
+// Legacy endpoints: now no-ops to avoid conflicting with socket-based presence
+
+router.post("/messaging/online", async (req, res) => {
+  try {
+    // Deprecated: presence is now managed by WebSocket connections only
+    console.log("[messaging] POST /messaging/online called (no-op)");
+    res.json({ success: true, note: "Presence handled via WebSocket" });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post("/messaging/offline", async (req, res) => {
+  try {
+    // Deprecated: presence is now managed by WebSocket connections only
+    console.log("[messaging] POST /messaging/offline called (no-op)");
+    res.json({ success: true, note: "Presence handled via WebSocket" });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Online users list (now truly "who has active sockets", not "who opened messenger")
+router.get("/messaging/online-users", async (req, res) => {
+  try {
+    const userId = req.query.userid as string;
+    if (!userId) {
+      return res.status(400).json({ error: "userid required" });
+    }
+    const onlineUsers = await getOnlineUsers(userId);
+    res.json({ success: true, data: onlineUsers });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Conversation creation
+router.post("/messaging/conversation", async (req, res) => {
+  try {
+    const { otherUserId, userid } = req.body;
+    if (!userid || !otherUserId) {
+      return res
+        .status(400)
+        .json({ error: "userid and otherUserId required" });
+    }
+    const convId = await getOrCreateConversation(userid, otherUserId);
+    res.json({ success: true, conversationId: convId });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Send message
+router.post("/messaging/send", async (req, res) => {
+  try {
+    const { conversationId, content, userid } = req.body;
+    if (!conversationId || !content || !userid) {
+      return res
+        .status(400)
+        .json({ error: "conversationId, content, and userid required" });
+    }
+    const message = await sendMessage(conversationId, userid, content);
+    res.json({ success: true, data: message });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get conversation messages
+router.get("/messaging/conversation/:conversationId", async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const messages = await getConversationMessages(conversationId);
+    res.json({ success: true, data: messages });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List user conversations
+router.get("/messaging/conversations", async (req, res) => {
+  try {
+    const userId = req.query.userid as string;
+    if (!userId) {
+      return res.status(400).json({ error: "userid required" });
+    }
+    const conversations = await getUserConversations(userId);
+    res.json({ success: true, data: conversations });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark messages read
+router.post("/messaging/mark-read", async (req, res) => {
+  try {
+    const { conversationId, userid } = req.body;
+    if (!conversationId || !userid) {
+      return res
+        .status(400)
+        .json({ error: "conversationId and userid required" });
+    }
+    await markMessagesRead(conversationId, userid);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+export default router;
+```
+
+The **only meaningful presence endpoint** left is `GET /messaging/online-users`, which now returns “users who have active sockets,” regardless of whether they are in the messenger UI.[2][1]
+
+---
+
+## 4. Frontend – ensure sockets carry userId
+
+Wherever you initialize the Socket.io client (for general app realtime, not just video), pass the logged‑in user’s ID so presence can use it.
+
+Example (adjust to your actual client init):
+
+```ts
+import { io } from "socket.io-client";
+
+// After you know currentUserId
+const socket = io("/", {
+  transports: ["websocket"],
+  query: { userId: currentUserId },
+});
+```
+
+Or using `auth`:
+
+```ts
+const socket = io("/", {
+  transports: ["websocket"],
+  auth: { userId: currentUserId },
+});
+```
+
+As long as `userId` reaches `socket.handshake.query` or `socket.handshake.auth`, the backend code above will mark presence correctly.[1]
+
+---
+
+## 5. Result
+
+After these paste‑in changes:
+
+- A user is **online** when they have at least one active Socket.io connection with a userId.  
+- They go **offline** once all their sockets disconnect.  
+- `/messaging/online-users` always returns “who is actually connected to the system right now,” not “who opened messenger.”  
+- The old `/messaging/online` and `/messaging/offline` are harmless no‑ops and cannot conflict.
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/3ddd18d4-1107-4ca6-a598-8a2d2fd61570/COMPLETE-CODEBASE-SNAPSHOT-2025-12-24.md)
+[2](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/4678fae1-fd22-4b02-9e1c-1a9ee1fb78d2/messaging.ts)
+[3](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/e4ade863-433a-47b8-87bc-3d52daae98ab/ira-neuro-complete.md)
+[4](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/484026ce-e4a2-4452-9533-04ea24853bf6/ira-neuro-config.md)
+[5](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d9efe794-0350-49ca-ae82-6b8c2bb74559/ira-neuro-database.md)
+[6](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/7c5f31ca-30f8-4c5c-bd2d-2974ab30e368/JitsiOverlay.tsx)
+[7](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d20276eb-47c2-49c4-b178-eb364ba44d53/ConversationList.tsx)
+[8](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d45efade-97c7-4cde-9ab5-eda036e01548/ChatMetrics.tsx)
+[9](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/85af2b2c-0b25-403d-97e2-6b46c1b47767/ChatMessage.tsx)
+[10](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/138147cc-a238-45e8-9e4a-bd5425abaf44/ChatInput.tsx)
+[11](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/b3d6bf8f-3adb-418c-8b3d-1fd68e0c9aff/Layout.tsx)
+[12](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/9895ee21-cb06-46d7-9503-55c3596f29d0/JitsiOverlay.tsx)
+[13](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/0d794e58-3c42-4ecb-8293-04301791ea2c/metricsRoute.ts)

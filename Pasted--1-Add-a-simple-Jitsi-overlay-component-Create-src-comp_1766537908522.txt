@@ -1,0 +1,166 @@
+## 1. Add a simple Jitsi overlay component
+
+Create `src/components/JitsiOverlay.tsx`:
+
+```tsx
+import React from 'react';
+
+interface JitsiOverlayProps {
+  roomName: string | null;
+  displayName: string;
+  onClose: () => void;
+}
+
+export default function JitsiOverlay({ roomName, displayName, onClose }: JitsiOverlayProps) {
+  if (!roomName) return null;
+
+  const url = `https://meet.jit.si/${encodeURIComponent(
+    roomName,
+  )}#userInfo.displayName="${encodeURIComponent(displayName)}"`;
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        top: 16,
+        right: 16,
+        width: 360,
+        height: 240,
+        zIndex: 60,
+        borderRadius: 12,
+        overflow: 'hidden',
+        boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+        border: '1px solid #4b5563',
+        background: '#020617',
+        display: 'flex',
+        flexDirection: 'column',
+      }}
+    >
+      <div
+        style={{
+          padding: '4px 8px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          background: '#020617',
+          borderBottom: '1px solid #4b5563',
+        }}
+      >
+        <span style={{ fontSize: 12, color: '#e5e7eb' }}>Video call</span>
+        <button
+          onClick={onClose}
+          style={{
+            border: 'none',
+            background: 'transparent',
+            color: '#e5e7eb',
+            fontSize: 12,
+            cursor: 'pointer',
+          }}
+        >
+          ✕
+        </button>
+      </div>
+      <iframe
+        src={url}
+        title="Jitsi Video Call"
+        allow="camera; microphone; fullscreen; display-capture"
+        style={{
+          border: 'none',
+          width: '100%',
+          height: '100%',
+        }}
+      />
+    </div>
+  );
+}
+```
+
+This is the PiP‑style “eyes” window that floats over your UI and embeds Jitsi’s hosted room. [1][2]
+
+***
+
+## 2. Update `ProfileMessenger.tsx` to use Jitsi
+
+In `src/components/ProfileMessenger.tsx`, make three small modifications.
+
+### 2.1 Import the overlay and add state
+
+At the top, add:
+
+```tsx
+import JitsiOverlay from './JitsiOverlay';
+```
+
+Inside the component, add state for the current room and support flag:
+
+```tsx
+const [videoRoom, setVideoRoom] = useState<string | null>(null);
+const [videoSupported, setVideoSupported] = useState(true);
+```
+
+Right after your hooks, add a simple capability check:
+
+```tsx
+useEffect(() => {
+  const hasMedia =
+    typeof navigator !== 'undefined' &&
+    !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const hasRTCPeer =
+    typeof window !== 'undefined' && typeof (window as any).RTCPeerConnection !== 'undefined';
+
+  // For hosted Jitsi, we mostly need getUserMedia; RTCPeerConnection is handled inside iframe,
+  // but checking both gives you a clearer “not supported” message.
+  setVideoSupported(hasMedia && hasRTCPeer);
+}, []);
+```
+
+### 2.2 Replace the “Start video” handler
+
+Find the existing `onClick` for the “Start video” button that currently does `alert('Video call placeholder…')` and replace that handler body with:
+
+```tsx
+onClick={() => {
+  if (!activeConversation || !activeConversationId) return;
+
+  if (!videoSupported) {
+    alert(
+      'Video is not available in this browser. Please use a modern browser (Chrome, Edge, Firefox) or continue with text chat.',
+    );
+    return;
+  }
+
+  // Create a deterministic but unique-ish room name per conversation
+  const base = `neurocore-${activeConversationId}`;
+  setVideoRoom(base);
+}}
+```
+
+This keeps 1:1 semantics: the “room” is tied to the conversation ID, so only participants in that conversation will know the room name. [3][4]
+
+### 2.3 Render the overlay
+
+At the very end of the `return` JSX of `ProfileMessenger`, **just before** the closing `</div>` of the outermost container, add:
+
+```tsx
+<JitsiOverlay
+  roomName={videoRoom}
+  displayName={username}
+  onClose={() => setVideoRoom(null)}
+/>
+```
+
+This will show the floating Jitsi call box when `videoRoom` is set, and hide it when closed.
+
+***
+
+## 3. Behavior you get now
+
+With these changes in place:
+
+- The **messenger text UI** continues to use your `/api/messaging/*` routes and Postgres as before. [3]
+- The **file attachment** flows you already wired with `useFileUpload` still work unchanged. [5]
+- Clicking **“Start video”**:
+  - Checks whether the browser has the basic WebRTC/media APIs. [6][7]
+  - If not, shows a clear message and **falls back** to text/file chat.  
+  - If supported, opens a **picture‑in‑picture Jitsi Meet room** tied to the conversation ID, sitting in the top‑right of your app, so users can still see the AI chat and messenger beneath it. [1][8]
+

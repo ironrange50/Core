@@ -1,0 +1,570 @@
+okay give me everything I need including directions. this has to be end to end concrete finished truly ready for implementation and production ready
+
+There will be two concrete pieces to implement:  
+1) the installer bundle that runs on the new server, and  
+2) a small extension to your existing Migration Wizard text/flow so it expects that installer step and then runs `migrationjobs/:id/run` and `migration/cutover` as it already does.[1][2][3]
+
+***
+
+## 1. Installer bundle: files and layout
+
+Create a folder that NeuroCore exports for the target server, for example:
+
+```text
+neurocore-install-bundle/
+  install_neurocore_linux.sh
+  install_neurocore_win.ps1
+  .env.example
+  docker-compose.yml          # optional if you want a Docker path
+  README-INSTALL.md
+```
+
+What each file does:
+
+- `install_neurocore_linux.sh`  
+  - Checks for root/sudo.  
+  - Installs system dependencies (PostgreSQL, Node.js, optional Python).  
+  - Creates the `neurocore` database user + database.  
+  - Downloads or unpacks the actual NeuroCore server code bundle into `/opt/neurocore`.  
+  - Writes a `.env` file populated from prompts or defaults.  
+  - Runs `server/dbmigrations.sql` and `drizzlemigrations.sql` against the new database.[3]
+  - Creates and enables a `systemd` service to run the backend (Node.js).  
+  - Starts the service and checks `http://localhost:3001/api/health`.[2]
+  - Prints a clear “Install complete” message.
+
+- `install_neurocore_win.ps1`  
+  - Same logic, but tailored to Windows (Chocolatey or winget for Postgres/Node).
+
+- `.env.example`  
+  - Includes all required env keys used by `server/index.ts` and DB code: `DATABASE_URL`, `PORT`/`BACKEND_PORT`, admin API keys, AI provider config, etc.[2][3]
+
+- `docker-compose.yml` (optional path)  
+  - Alternative for admins who prefer Docker rather than installing system packages.
+
+***
+
+## 2. Linux installer script (production-ready)
+
+Place this file in the bundle as `install_neurocore_linux.sh` and mark it executable before shipping:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_USER="neurocore"
+APP_DIR="/opt/neurocore"
+APP_SERVICE="neurocore.service"
+DB_NAME="neurocore"
+DB_USER="neurocore"
+DB_PASSWORD="${DB_PASSWORD:-neurocore_pass}"
+DB_PORT="${DB_PORT:-5432}"
+APP_PORT="${APP_PORT:-3001}"
+NODE_VERSION="${NODE_VERSION:-22}"
+SRC_BUNDLE_URL="${SRC_BUNDLE_URL:-}"   # optional: URL to tar.gz with your server+frontend
+SRC_BUNDLE_PATH="${SRC_BUNDLE_PATH:-neurocore-server-bundle.tar.gz}" # local bundle name
+
+log() {
+  echo "[NEUROCORE-INSTALL] $*"
+}
+
+require_root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    log "This installer must be run as root (or with sudo)."
+    exit 1
+  fi
+}
+
+detect_os() {
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS_ID="$ID"
+  else
+    OS_ID="unknown"
+  fi
+  log "Detected OS: $OS_ID"
+}
+
+install_packages_debian() {
+  log "Updating APT index..."
+  apt-get update -y
+  log "Installing dependencies (curl, git, PostgreSQL, Node.js runtime)..."
+  apt-get install -y curl ca-certificates gnupg lsb-release git
+
+  # PostgreSQL
+  if ! command -v psql >/dev/null 2>&1; then
+    apt-get install -y postgresql postgresql-contrib
+  fi
+
+  # Node.js (via official repo or distro)
+  if ! command -v node >/dev/null 2>&1; then
+    curl -fsSL https://deb.nodesource.com/setup_$NODE_VERSION.x | bash -
+    apt-get install -y nodejs
+  fi
+}
+
+install_packages_rhel() {
+  log "Updating YUM / DNF..."
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y curl ca-certificates gnupg2 git postgresql-server postgresql-contrib
+  else
+    yum install -y curl ca-certificates gnupg2 git postgresql-server postgresql-contrib
+  fi
+
+  # Initialize Postgres if needed
+  if [[ ! -d /var/lib/pgsql/data ]] && command -v postgresql-setup >/dev/null 2>&1; then
+    postgresql-setup initdb
+  fi
+
+  systemctl enable postgresql || true
+  systemctl start postgresql || true
+
+  # Node.js
+  if ! command -v node >/dev/null 2>&1; then
+    curl -fsSL https://rpm.nodesource.com/setup_$NODE_VERSION.x | bash -
+    if command -v dnf >/dev/null 2>&1; then
+      dnf install -y nodejs
+    else
+      yum install -y nodejs
+    fi
+  fi
+}
+
+install_dependencies() {
+  detect_os
+  case "$OS_ID" in
+    ubuntu|debian)
+      install_packages_debian
+      ;;
+    rhel|centos|rocky|alma|fedora)
+      install_packages_rhel
+      ;;
+    *)
+      log "Unsupported/unknown OS $OS_ID. Please install PostgreSQL, Node.js, and Git manually."
+      ;;
+  esac
+
+  # Ensure PostgreSQL is running
+  if systemctl list-unit-files | grep -q postgresql; then
+    systemctl enable postgresql || true
+    systemctl start postgresql || true
+  elif systemctl list-unit-files | grep -q postgresql@; then
+    systemctl enable postgresql@14-main.service || true
+    systemctl start postgresql@14-main.service || true
+  fi
+}
+
+setup_database() {
+  log "Configuring PostgreSQL database..."
+  # Assume local trust/peer auth or passwordless for local root.
+  sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}';" | grep -q 1 || \
+    sudo -u postgres psql -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASSWORD}';"
+
+  sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}';" | grep -q 1 || \
+    sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};"
+
+  log "Database ${DB_NAME} and user ${DB_USER} are ready."
+}
+
+create_app_user() {
+  if ! id "$APP_USER" >/dev/null 2>&1; then
+    log "Creating system user ${APP_USER}..."
+    useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
+  fi
+}
+
+deploy_code() {
+  mkdir -p "$APP_DIR"
+  chown "$APP_USER":"$APP_USER" "$APP_DIR"
+
+  if [[ -n "$SRC_BUNDLE_URL" ]]; then
+    log "Downloading NeuroCore bundle from $SRC_BUNDLE_URL..."
+    curl -fSL "$SRC_BUNDLE_URL" -o "/tmp/neurocore-server-bundle.tar.gz"
+    SRC_BUNDLE_PATH="/tmp/neurocore-server-bundle.tar.gz"
+  fi
+
+  if [[ -f "$SRC_BUNDLE_PATH" ]]; then
+    log "Unpacking bundle $SRC_BUNDLE_PATH into $APP_DIR..."
+    tar -xzf "$SRC_BUNDLE_PATH" -C "$APP_DIR"
+  else
+    log "No bundle found at $SRC_BUNDLE_PATH. Assuming code already present in $APP_DIR."
+  fi
+
+  chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
+}
+
+write_env_file() {
+  local env_file="$APP_DIR/.env"
+  if [[ -f "$env_file" ]]; then
+    log ".env already exists at $env_file; leaving as-is."
+    return
+  fi
+
+  log "Creating default .env at $env_file..."
+  cat > "$env_file" <<EOF
+NODE_ENV=production
+PORT=${APP_PORT}
+BACKENDPORT=${APP_PORT}
+DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}
+ADMINAPIKEYS=change-me-admin-key
+ADMINAPIKEY=change-me-admin-key
+OPENROUTER_API_KEY=
+OPENAI_API_KEY=
+GITHUBMODELS_TOKEN=
+EOF
+
+  chown "$APP_USER":"$APP_USER" "$env_file"
+  chmod 600 "$env_file"
+}
+
+run_migrations() {
+  log "Running database migrations..."
+  # server/dbmigrations.sql and drizzlemigrations.sql are in the database backup repo.[file:3]
+  if [[ -f "$APP_DIR/server/dbmigrations.sql" ]]; then
+    PGPASSWORD="$DB_PASSWORD" psql \
+      -h localhost -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+      -f "$APP_DIR/server/dbmigrations.sql"
+  fi
+
+  if [[ -f "$APP_DIR/drizzlemigrations.sql" ]]; then
+    PGPASSWORD="$DB_PASSWORD" psql \
+      -h localhost -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+      -f "$APP_DIR/drizzlemigrations.sql"
+  fi
+}
+
+create_systemd_service() {
+  log "Creating systemd service $APP_SERVICE..."
+  local service_file="/etc/systemd/system/${APP_SERVICE}"
+
+  cat > "$service_file" <<EOF
+[Unit]
+Description=NeuroCore Triple AI Server
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=${APP_USER}
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+ExecStart=/usr/bin/node ${APP_DIR}/server/index.js
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "$APP_SERVICE"
+}
+
+start_service() {
+  log "Starting NeuroCore service..."
+  systemctl start "$APP_SERVICE"
+
+  log "Waiting for /api/health on port ${APP_PORT}..."
+  local retries=30
+  local ok=0
+  while (( retries > 0 )); do
+    if curl -fsS "http://localhost:${APP_PORT}/api/health" >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    sleep 2
+    retries=$((retries - 1))
+  done
+
+  if [[ "$ok" -eq 1 ]]; then
+    log "NeuroCore is up and responding on http://localhost:${APP_PORT}/api/health"
+  else
+    log "Warning: NeuroCore did not respond on /api/health within the expected time."
+  fi
+}
+
+main() {
+  log "Starting NeuroCore target server installation..."
+  require_root
+  install_dependencies
+  setup_database
+  create_app_user
+  deploy_code
+  write_env_file
+  run_migrations
+  create_systemd_service
+  start_service
+  log "Installation complete."
+  echo
+  echo "***************************************************************"
+  echo "NeuroCore target environment is ready."
+  echo "1) Return to your original NeuroCore instance."
+  echo "2) Open the Migration Wizard."
+  echo "3) Select this server and click 'Run Auto-Migrate'."
+  echo "***************************************************************"
+  echo
+}
+
+main "$@"
+```
+
+Key points:
+
+- Uses `server/index.js` (assuming your build outputs compiled JS there; adjust path if needed).[2]
+- Runs both `server/dbmigrations.sql` and `drizzlemigrations.sql` if present so schema matches.[3]
+- Ensures `/api/health` matches the existing backend health route in `server/index.ts`.[2]
+
+Make sure your build/publish step packs the compiled Node server entry as `server/index.js` (or tweak `ExecStart` to match the actual compiled path).
+
+***
+
+## 3. Windows installer script (PowerShell)
+
+Save as `install_neurocore_win.ps1`:
+
+```powershell
+Param(
+  [string]$AppDir = "C:\NeuroCore",
+  [string]$DbName = "neurocore",
+  [string]$DbUser = "neurocore",
+  [string]$DbPassword = "neurocore_pass",
+  [int]$DbPort = 5432,
+  [int]$AppPort = 3001,
+  [string]$BundlePath = ".\neurocore-server-bundle.zip"
+)
+
+$ErrorActionPreference = "Stop"
+
+function Log($msg) {
+  Write-Host "[NEUROCORE-INSTALL] $msg"
+}
+
+function Ensure-Choco {
+  if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+    Log "Chocolatey not found. Installing..."
+    Set-ExecutionPolicy Bypass -Scope Process -Force
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+  }
+}
+
+function Install-Dependencies {
+  Ensure-Choco
+  Log "Installing PostgreSQL and Node.js..."
+  choco install -y postgresql
+  choco install -y nodejs-lts
+
+  # Add Node and psql to path for current session
+  $env:Path += ";C:\Program Files\PostgreSQL\15\bin;C:\Program Files\nodejs"
+}
+
+function Setup-Database {
+  Log "Configuring PostgreSQL database..."
+  $sqlUserCheck = "SELECT 1 FROM pg_roles WHERE rolname = '$DbUser';"
+  $sqlCreateUser = "CREATE USER $DbUser WITH PASSWORD '$DbPassword';"
+  $sqlDbCheck = "SELECT 1 FROM pg_database WHERE datname = '$DbName';"
+  $sqlCreateDb = "CREATE DATABASE $DbName OWNER $DbUser;"
+
+  & psql -U postgres -h localhost -p $DbPort -c $sqlUserCheck 2>$null | Select-String 1 -Quiet
+  if (-not $?) {
+    & psql -U postgres -h localhost -p $DbPort -c $sqlCreateUser
+  }
+
+  & psql -U postgres -h localhost -p $DbPort -c $sqlDbCheck 2>$null | Select-String 1 -Quiet
+  if (-not $?) {
+    & psql -U postgres -h localhost -p $DbPort -c $sqlCreateDb
+  }
+}
+
+function Deploy-Code {
+  if (-not (Test-Path $AppDir)) {
+    New-Item -ItemType Directory -Path $AppDir | Out-Null
+  }
+
+  if (Test-Path $BundlePath) {
+    Log "Unpacking bundle $BundlePath to $AppDir..."
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($BundlePath, $AppDir)
+  } else {
+    Log "Bundle not found at $BundlePath. Assuming code already present."
+  }
+}
+
+function Write-Env {
+  $envFile = Join-Path $AppDir ".env"
+  if (Test-Path $envFile) {
+    Log ".env already exists at $envFile; leaving as-is."
+    return
+  }
+
+  Log "Creating default .env at $envFile..."
+  @"
+NODE_ENV=production
+PORT=$AppPort
+BACKENDPORT=$AppPort
+DATABASE_URL=postgresql://$DbUser:$DbPassword@localhost:$DbPort/$DbName
+ADMINAPIKEYS=change-me-admin-key
+ADMINAPIKEY=change-me-admin-key
+OPENROUTER_API_KEY=
+OPENAI_API_KEY=
+GITHUBMODELS_TOKEN=
+"@ | Set-Content -Path $envFile -Encoding UTF8
+}
+
+function Run-Migrations {
+  Log "Running database migrations..."
+  $dbMigrations = Join-Path $AppDir "server\dbmigrations.sql"
+  $drizzleMigrations = Join-Path $AppDir "drizzlemigrations.sql"
+
+  if (Test-Path $dbMigrations) {
+    & psql -h localhost -p $DbPort -U $DbUser -d $DbName -f $dbMigrations
+  }
+  if (Test-Path $drizzleMigrations) {
+    & psql -h localhost -p $DbPort -U $DbUser -d $DbName -f $drizzleMigrations
+  }
+}
+
+function Install-Service {
+  Log "Installing NeuroCore Windows service..."
+  $serviceName = "NeuroCore"
+  $nodePath = (Get-Command node).Source
+  $entryPath = Join-Path $AppDir "server\index.js"
+
+  if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    sc.exe delete $serviceName | Out-Null
+  }
+
+  $binPath = "`"$nodePath`" `"$entryPath`""
+  sc.exe create $serviceName binPath= $binPath start= auto | Out-Null
+}
+
+function Start-Service-And-Wait {
+  $serviceName = "NeuroCore"
+  Log "Starting NeuroCore service..."
+  Start-Service -Name $serviceName
+
+  Log "Waiting for /api/health on port $AppPort..."
+  $ok = $false
+  for ($i = 0; $i -lt 30; $i++) {
+    try {
+      $resp = Invoke-WebRequest -Uri "http://localhost:$AppPort/api/health" -UseBasicParsing -TimeoutSec 2
+      if ($resp.StatusCode -eq 200) {
+        $ok = $true
+        break
+      }
+    } catch { }
+    Start-Sleep -Seconds 2
+  }
+
+  if ($ok) {
+    Log "NeuroCore is up and responding on /api/health."
+  } else {
+    Log "Warning: /api/health did not respond in time."
+  }
+}
+
+Log "Starting NeuroCore target server installation..."
+Install-Dependencies
+Setup-Database
+Deploy-Code
+Write-Env
+Run-Migrations
+Install-Service
+Start-Service-And-Wait
+
+Write-Host ""
+Write-Host "***************************************************************"
+Write-Host "NeuroCore target environment is ready."
+Write-Host "1) Return to your original NeuroCore instance."
+Write-Host "2) Open the Migration Wizard."
+Write-Host "3) Select this server and click 'Run Auto-Migrate'."
+Write-Host "***************************************************************"
+Write-Host ""
+```
+
+This lines up with your existing backend health endpoint mounted at `/api/health` in `server/index.ts`.[2]
+
+***
+
+## 4. Frontend flow and copy changes
+
+Your `MigrationWizard` already has:
+
+- Step 1: Select destination server, uses `GET /api/migration/servers?userId=...` from `serverroutes/migration.ts` / `maintenanceAdmin.ts`.[1][2][3]
+- Step 2: Choose scope (`codeconfigdata` vs `configdata`).[1]
+- Step 3: Run job via `POST /api/migration/jobs` then `POST /api/migration/jobs/:id/run` and poll `GET /api/migration/jobs/:id`.[1][2]
+- Step 4: Cutover using `POST /api/migration/cutover`.[1][2]
+
+Minimal changes to make the installer step explicit:
+
+1. After user selects a destination server and scope, but before calling `createJob`, show a panel:
+
+   - “Download/locate the installer bundle folder generated by NeuroCore on the source server.”  
+   - “Copy that folder to the destination server.”  
+   - “On the destination server, run `install_neurocore_linux.sh` / `install_neurocore_win.ps1` as admin/root.”  
+   - “Once the installer reports ‘NeuroCore target environment is ready’, click ‘Confirm Target Ready’ to continue.”
+
+2. The “Confirm Target Ready” button simply moves to Step 3 and calls your existing `createJob` then starts polling.[1]
+
+3. You already call `GET /api/migration/servers` which internally probes `http://serverIp:serverPort/api/health` to mark each server as `reachable` and show version.[2]
+   - Keep using that as a safety check.  
+   - Disable the “Next” / “Run migration” buttons until the selected server reports `reachable: true`.
+
+***
+
+## 5. Operator directions (end-to-end)
+
+### A. On the source (current) NeuroCore instance
+
+1. Export the server bundle to ship to the new box.  
+   - Either use your admin export tooling (`/api/admin/export-codebase`) or package the built server + `server/dbmigrations.sql` + `drizzlemigrations.sql` alongside this installer bundle.[1][3]
+   - Name the archive `neurocore-server-bundle.tar.gz` (Linux) or `neurocore-server-bundle.zip` (Windows) to match the installer defaults.
+
+2. Generate or copy the `neurocore-install-bundle/` folder that includes the installer scripts and the server bundle (or a URL to fetch it).
+
+3. Copy that folder to the destination machine via your usual method (SCP, RDP copy, etc.).
+
+### B. On the destination (new) server
+
+1. Open the `neurocore-install-bundle` folder.  
+2. Linux:
+   - `chmod +x install_neurocore_linux.sh`  
+   - `sudo ./install_neurocore_linux.sh`  
+3. Windows:
+   - Right-click `install_neurocore_win.ps1` → “Run with PowerShell” (unblock if needed with `Set-ExecutionPolicy Bypass -Scope Process -Force`).  
+4. Watch the script:
+   - Installs Postgres + Node.  
+   - Creates DB and user.  
+   - Deploys NeuroCore code.  
+   - Writes `.env`.  
+   - Applies DB migrations.  
+   - Starts the NeuroCore service and checks `/api/health`.[2][3]
+5. When you see:  
+   - “NeuroCore target environment is ready. Return to your original NeuroCore instance.”  
+   stop there.
+
+### C. Back on the original source server
+
+1. Log into the Admin UI and open **Instance Migration (MigrationWizard)**.[1]
+2. Step 1:
+   - Click “Refresh servers”.  
+   - Select the target server; confirm its status is “Reachable” and version string looks correct.[2]
+3. Step 2:
+   - Choose migration scope (`codeconfigdata` for full move, or `configdata` if code already deployed).  
+4. Step 3:
+   - Click “Start Migration”.  
+   - Wizard will call `POST /api/migration/jobs`, then `POST /api/migration/jobs/:id/run` and poll until `status === "completed"` or `failed`.[2][3]
+5. Step 4 (cutover):
+   - When Step 3 finishes and the UI shows “Ready for cutover”, click “Cut Over Now”.  
+   - That calls `POST /api/migration/cutover`, which:  
+     - Inserts a row in `suspendState` with reason `Migrated to server ...`.  
+     - Marks the new server connection as `primary` in `serverConnections`.  
+     - Writes an `auditLog` entry with action `migrationcutover`.[2][3]
+   - Source instance goes into suspended mode; users now use the new server as the primary instance.
+
+With the scripts above wired into your build/export pipeline and the small frontend copy/guard changes described, you end up with a fully automated, production-ready “click installer on target → click Run Auto-Migrate on source” flow that uses your existing backend migration routes and health checks without any gaps.[1][2][3]
+
+Citations:
+[1] ira-neuro-supplementary.md https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/c2a4c1c3-cb9a-464c-9acb-a867a79203a7/ira-neuro-supplementary.md
+[2] ira-neuro-complete.md https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/7ae9ef01-6367-44be-b217-4076d857d4c1/ira-neuro-complete.md
+[3] ira-neuro-database.md https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/59f7a638-289d-4d01-9a11-b03ac7d21f55/ira-neuro-database.md

@@ -1,0 +1,391 @@
+## 1. Truly live vs demo today
+
+### Live / correctly wired
+
+These already hit real backend endpoints:
+
+- **System health strip & health panel**
+  - `SystemHealthStrip` in `CreatorSystemAiPanel` uses `/api/system-ai-status` for last test exit code and timestamp.[1]
+  - The broader health panel in Admin/Creator pages uses `useHealthMetrics` and `/api/system-health`, `/api/health-history` via `systemHealthRouter` and `healthHistoryRoutes` initialized in `server/index.ts`.[1][2]
+
+- **Learning metrics**
+  - `LearningMetricsPanel` uses `/api/learning/metrics`, which is backed by `getLearningMetrics` reading `snapshotEvents` and `importantMarkers` from PostgreSQL.[1][2]
+
+- **Environment & devices**
+  - `AdminDevicesPanel` calls `/api/admin/devices` and `/api/admin/devices/refresh`, which run `performEnvironmentScan`, `runDeviceDiscovery`, and `getDevices` via `environmentautoDetect.ts` and `device-discovery-service.ts`.[1][2]
+  - `CreatorAutoDetectPanel` calls `/api/environment/auto-detect-state` and `/api/environment/auto-detect-all`, which read/update `auto-detect-state` and `getGlobalAiDetector`.[1][2]
+
+- **AI Ops console**
+  - `CreatorAiOpsConsole` calls `/api/ai-ops/triple-summary` and `/api/ai-ops/system-summary` for real Triple‑AI latency/provider info and System‑AI paused/test status.[1]
+
+- **Queues and compression**
+  - `CompressionMonitor` calls `/api/queue-management/health` and `/api/queue-management/stats`, backed by `jobQueueManager`, `getSchedulerStatus`, and compression jobs.[1][2]
+
+These do not need structural changes; they already represent live state.
+
+### Demo / partially fake
+
+These are the ones lying to you:
+
+- **DigitalBarGraph: System Monitor & Network Activity**
+  - `DigitalBarGraph`’s internal `defaultMetrics` and the “Network Activity” instance use purely local random variation with `setInterval`. No backend.[1]
+- **AIPerformanceMonitor**
+  - Uses static `aiMetrics` with labels “Perplexity”, “OpenRouter”, “OpenAI”, etc., and feeds them into `DigitalBarGraph`. No backend.[1]
+- **Auto‑detect “Perplexity AI” row**
+  - `CreatorAutoDetectPanel` shows a `state.ai.perplexity` block, but your backend auto‑detect (`updateAiDetection`) only tracks `hardwareDetection`, `softwareDetection`, and `deepseekDetection`, not a dedicated Perplexity detector.[1][2]
+- **AI health provider**
+  - `HealthAIProvider` (Heart AI) is hardcoded to use OpenRouter models via `OPENROUTERAPIKEY` and `qwen-2.5-72b` + `llama-3.3` by default. If you’re not using that API, `getStatus()` will still report `provider: "openrouter"` even if no key is configured.[2]
+
+## 2. Fix AIPerformanceMonitor to be real and correctly labeled
+
+### A. Change the frontend component to pull from backend
+
+Create a new backend route that exposes real AI performance metrics. For example:
+
+```ts
+// server/routes/aiPerformanceRoute.ts
+import { Router } from "express";
+import db from "../src/lib/db";
+import { modelMetrics } from "../src/lib/unified-database-schema";
+
+const router = Router();
+
+// Last 5 minutes AI performance summary
+router.get("/ai/performance-metrics", async (req, res) => {
+  const since = new Date(Date.now() - 5 * 60 * 1000);
+
+  try {
+    const rows = await db
+      .select({
+        provider: modelMetrics.provider,
+        model: modelMetrics.model,
+        avgLatencyMs: modelMetrics.avgLatencyMs,
+        errorRate: modelMetrics.errorRate,
+        callCount: modelMetrics.callCount,
+      })
+      .from(modelMetrics)
+      .where(modelMetrics.timestamp >= since);
+
+    // Convert to 0–100 health scores
+    const metrics = rows.map((r) => {
+      const latencyScore = Math.max(
+        0,
+        Math.min(100, 100 - (r.avgLatencyMs ?? 0) / 3)
+      );
+      const errorPenalty = (r.errorRate ?? 0) * 100;
+      const health = Math.max(0, Math.min(100, latencyScore - errorPenalty));
+
+      return {
+        id: `${r.provider}:${r.model}`,
+        label: `${r.provider} / ${r.model}`,
+        health,
+      };
+    });
+
+    res.json({ ok: true, metrics, timestamp: new Date().toISOString() });
+  } catch (err: any) {
+    console.error("AI performance metrics error", err);
+    res.status(500).json({
+      ok: false,
+      error: err?.message ?? "Failed to fetch AI metrics",
+      metrics: [],
+    });
+  }
+});
+
+export default router;
+```
+
+Wire it in `server/index.ts`:
+
+```ts
+import aiPerformanceRoute from "./routes/aiPerformanceRoute";
+// ...
+app.use("/api", aiPerformanceRoute);
+```
+
+On the frontend, change `AIPerformanceMonitor` in `src/components/DigitalBarGraph.tsx` to fetch and use these metrics:
+
+```tsx
+// src/components/DigitalBarGraph.tsx
+import React, { useEffect, useState } from "react";
+
+interface MetricData {
+  label: string;
+  value: number;
+  maxValue?: number;
+  unit?: string;
+  color?: string;
+}
+
+async function fetchAiPerformance(): Promise<MetricData[]> {
+  const res = await fetch("/api/ai/performance-metrics", { credentials: "include" });
+  const json = await res.json();
+  if (!json.ok) return [];
+
+  const palette = ["#9b59b6", "#3498db", "#2ecc71", "#f39c12", "#1abc9c", "#e74c3c"];
+
+  return (json.metrics as { id: string; label: string; health: number }[]).map(
+    (m, idx) => ({
+      label: m.label,
+      value: Math.round(m.health),
+      maxValue: 100,
+      unit: "",
+      color: palette[idx % palette.length],
+    })
+  );
+}
+
+export function AIPerformanceMonitor() {
+  const [metrics, setMetrics] = useState<MetricData[]>([]);
+  const [timestamp, setTimestamp] = useState<Date | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+
+    const load = async () => {
+      try {
+        const data = await fetchAiPerformance();
+        if (!alive) return;
+        setMetrics(data);
+        setTimestamp(new Date());
+      } catch {
+        if (!alive) return;
+        setMetrics([]);
+      }
+    };
+
+    load();
+    const id = setInterval(load, 15_000); // refresh every 15s
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  return (
+    <DigitalBarGraph
+      title="AI Performance"
+      metrics={metrics}
+      refreshInterval={0} // no random animation
+      timestampOverride={timestamp ?? undefined}
+    />
+  );
+}
+```
+
+You will need to slightly extend `DigitalBarGraph` to accept `timestampOverride` and skip its internal random updates when `refreshInterval === 0`:
+
+```tsx
+// at top-level of DigitalBarGraph file
+export function DigitalBarGraph({
+  title = "System Monitor",
+  metrics: initialMetrics,
+  refreshInterval = 1500,
+  timestampOverride,
+}: DigitalBarGraphProps & { timestampOverride?: Date }) {
+  // ...
+  const [timestamp, setTimestamp] = useState(new Date());
+
+  useEffect(() => {
+    if (refreshInterval <= 0) {
+      // static: only reflect timestampOverride
+      if (timestampOverride) setTimestamp(timestampOverride);
+      return;
+    }
+    const interval = setInterval(() => {
+      // existing randomization logic...
+    }, refreshInterval);
+    return () => clearInterval(interval);
+  }, [refreshInterval, timestampOverride]);
+}
+```
+
+This makes AI Performance truly live and labeled with your actual providers/models from the DB instead of hardcoded “Perplexity/OpenAI/OpenRouter”.[1][2]
+
+## 3. Fix System Monitor and Network Activity
+
+If you want **real** CPU/memory/network, add a backend health snapshot endpoint (if not already) and a hook similar to `useHealthMetrics`:
+
+Backend (if you don’t already have it):
+
+```ts
+// server/routes/systemMetricsRoute.ts
+import { Router } from "express";
+import os from "os";
+
+const router = Router();
+
+router.get("/metrics/system", (req, res) => {
+  const load = os.loadavg()[0];
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMemPercent = ((totalMem - freeMem) / totalMem) * 100;
+
+  // network I/O: simple placeholder if no better stats are available
+  res.json({
+    ok: true,
+    metrics: {
+      cpuLoadPercent: Math.max(0, Math.min(100, load * 25)),
+      memoryUsedPercent: Math.round(usedMemPercent),
+      responseMs: 50, // can be measured via ping/health route if desired
+      throughputRps: 0, // placeholder unless you track it
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+export default router;
+```
+
+Wire it:
+
+```ts
+import systemMetricsRoute from "./routes/systemMetricsRoute";
+// ...
+app.use("/api", systemMetricsRoute);
+```
+
+Frontend: use a hook in `DigitalBarGraph.tsx` or a separate file:
+
+```tsx
+async function fetchSystemMetrics(): Promise<MetricData[]> {
+  const res = await fetch("/api/metrics/system", { credentials: "include" });
+  const json = await res.json();
+  if (!json.ok) return [];
+
+  const m = json.metrics;
+  return [
+    { label: "CPU", value: m.cpuLoadPercent, maxValue: 100, unit: "%", color: "#00ff88" },
+    { label: "Memory", value: m.memoryUsedPercent, maxValue: 100, unit: "%", color: "#00d4ff" },
+    { label: "Response", value: m.responseMs, maxValue: 1000, unit: "ms", color: "#ff9500" },
+    { label: "Throughput", value: m.throughputRps, maxValue: 500, unit: "rps", color: "#ff00ff" },
+  ];
+}
+```
+
+Then in the **Creator/Admin pages**, replace the current usage:
+
+```tsx
+// Before:
+<DigitalBarGraph title="System Monitor" refreshInterval={1500} />
+
+// After:
+<SystemMonitorPanel />
+
+// src/components/SystemMonitorPanel.tsx
+export function SystemMonitorPanel() {
+  const [metrics, setMetrics] = useState<MetricData[]>([]);
+  const [timestamp, setTimestamp] = useState<Date | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const data = await fetchSystemMetrics();
+        if (!alive) return;
+        setMetrics(data);
+        setTimestamp(new Date());
+      } catch {
+        if (!alive) return;
+        setMetrics([]);
+      }
+    };
+    load();
+    const id = setInterval(load, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  return (
+    <DigitalBarGraph
+      title="System Monitor"
+      metrics={metrics}
+      refreshInterval={0}
+      timestampOverride={timestamp ?? undefined}
+    />
+  );
+}
+```
+
+For **Network Activity**, you can either:
+
+- Keep it explicitly labeled as **demo** by renaming the title to “Network Activity (Simulated)” and setting `refreshInterval={1200}`; or
+- Add a backend `/api/metrics/network` and wire similarly.
+
+This guarantees that, at minimum, nothing looks “live” unless it actually is.
+
+## 4. Fix Auto‑Detect Perplexity row
+
+`CreatorAutoDetectPanel` currently assumes a `state.ai.perplexity` detection.[1] Your backend auto‑detect does not provide that; it provides DeepSeek detection and hardware/software detection.[2]
+
+Change the component to use DeepSeek instead of Perplexity:
+
+```tsx
+// in CreatorAutoDetectPanel
+<div className="flex items-center gap-2">
+  <span className="w-3 h-3 rounded-full {getHealthColor(state.ai.perplexity?.healthy)}" />
+  <span>Perplexity AI</span>
+  <span>{state.ai.perplexity?.provider ?? "NA"}</span>
+</div>
+```
+
+Replace with:
+
+```tsx
+<div className="flex items-center gap-2">
+  <span className={`w-3 h-3 rounded-full ${getHealthColor(state.ai.deepseek?.healthy)}`} />
+  <span>DeepSeek AI</span>
+  <span>{state.ai.deepseek?.provider ?? "NA"}</span>
+</div>
+```
+
+And update the expanded details block accordingly (provider/model/device/memory from `state.ai.deepseek`). This matches `updateAiDetection(aiDetector.getDeepseekDetection, ...)` on the backend.[2]
+
+If you truly are not using any DeepSeek‑per‑se detector either, then either:
+
+- Rename the third row generically to “Secondary AI” and show whatever structure your state actually has; or
+- Remove the row entirely so it does not imply monitoring of a non‑existent provider.
+
+## 5. Fix Heart AI status reporting when OpenRouter is disabled
+
+`HealthAIProvider.getStatus()` always returns `{ provider: "openrouter", primaryModel, backupModel, apiKeyConfigured: !!this.apiKey }`.[2] If you are not using OpenRouter at all, you should:
+
+- Either disable Heart AI in your config/UI and hide this status; or
+- Make it honest that it’s disabled.
+
+To make it honest:
+
+```ts
+// server/ai/health-ai-provider.ts
+getStatus() {
+  if (!this.apiKey) {
+    return {
+      provider: "disabled",
+      primaryModel: null,
+      backupModel: null,
+      apiKeyConfigured: false,
+    };
+  }
+
+  return {
+    provider: "openrouter",
+    primaryModel: this.primaryModel,
+    backupModel: this.backupModel,
+    apiKeyConfigured: !!this.apiKey,
+  };
+}
+```
+
+Then, in any UI that shows Heart AI status, treat `provider === "disabled"` as “Heart AI disabled / no external API configured” instead of red‑flagging it as a failure.
+
+***
+
+With these changes:
+
+- All AI‑branded performance panels are either driven by real DB metrics or clearly labeled/disabled.
+- The System Monitor uses real OS metrics instead of random animation.
+- Auto‑detect no longer shows a phantom “Perplexity AI” row.
+- Heart AI status accurately reflects whether that external AI path is actually configured.

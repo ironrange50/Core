@@ -1,0 +1,170 @@
+Portal Dashboard Fix - Complete Implementation Guide
+🎯 Problem Summary
+
+Error: "Endpoint or method not allowed via portal"
+System AI endpoints not working from portal
+Maintenance endpoints not working from portal
+Some buttons don't respond
+
+🔧 Root Cause
+The portal authentication middleware isn't properly configured on backend routes, and frontend API calls may be missing the X-Portal-Secret header.
+
+✅ Step-by-Step Fix
+Step 1: Update Portal Auth Middleware (5 minutes)
+File: server/middleware/portal-auth.ts
+Replace the entire file with the content from fixed-portal-auth.ts I created.
+Key changes:
+
+Better error messages
+Three authentication modes: strict portal, optional portal, or portal-or-role
+Helper functions for authorization checks
+Logging for debugging
+
+Step 2: Fix System AI Routes (10 minutes)
+File: server/routes/system-ai-routes.ts (or wherever your System AI routes are)
+Before:
+typescriptrouter.get('/status', requireAuth, async (req, res) => {
+  // ... your logic
+});
+After:
+typescriptimport { requirePortalOrRole } from '../middleware/portal-auth';
+
+router.get('/status', requirePortalOrRole('creator', 'admin'), async (req, res) => {
+  // ... your logic
+});
+Apply this pattern to ALL System AI routes:
+
+/status - GET
+/pause - POST
+/resume - POST
+/health-check - GET
+/run-diagnostics - POST
+Any other System AI endpoints
+
+Step 3: Fix Maintenance Routes (10 minutes)
+File: server/routes/maintenance.ts and server/routes/maintenanceRoutes.ts
+Same pattern as System AI routes:
+typescriptimport { requirePortalOrRole } from '../middleware/portal-auth';
+
+// Status
+router.get('/status', requirePortalOrRole('creator', 'admin'), handler);
+
+// Snapshots
+router.post('/snapshot/create', requirePortalOrRole('creator', 'admin'), handler);
+router.get('/snapshots', requirePortalOrRole('creator', 'admin'), handler);
+router.post('/snapshot/:id/restore', requirePortalOrRole('creator'), handler);
+
+// Cleanup
+router.post('/cleanup/run', requirePortalOrRole('creator', 'admin'), handler);
+
+// Compression
+router.post('/compression/run', requirePortalOrRole('creator', 'admin'), handler);
+router.get('/compression/status', requirePortalOrRole('creator', 'admin'), handler);
+
+// Tasks
+router.get('/tasks', requirePortalOrRole('creator', 'admin'), handler);
+router.post('/tasks/:id/run', requirePortalOrRole('creator', 'admin'), handler);
+router.patch('/tasks/:id', requirePortalOrRole('creator'), handler);
+Step 4: Update Portal Frontend API Calls (15 minutes)
+Option A: Use the Portal API Client (Recommended)
+
+Copy portalApiClient.ts to server/portal/ or src/lib/
+Update all portal components to use it:
+
+Before:
+typescriptconst response = await fetch('/api/system-ai/status');
+const data = await response.json();
+After:
+typescriptimport { systemAi } from './portalApiClient';
+
+const data = await systemAi.getStatus();
+Option B: Add Headers Manually
+If you prefer to keep existing fetch calls, add the header:
+typescriptconst PORTAL_SECRET = 'IraCoreApp1!'; // Or read from env
+
+fetch('/api/system-ai/status', {
+  headers: {
+    'X-Portal-Secret': PORTAL_SECRET,
+    'Content-Type': 'application/json'
+  }
+})
+Step 5: Update Environment Variables (2 minutes)
+File: .env
+Ensure this line exists:
+PORTAL_SECRET=IraCoreApp1!
+File: server/portal/.env or portal config (if separate)
+Match the same secret:
+VITE_PORTAL_SECRET=IraCoreApp1!
+Step 6: Restart Services (3 minutes)
+bash# Stop all services
+# Ctrl+C in each terminal
+
+# Restart backend
+npm run server
+
+# Restart portal (in separate terminal)
+npx tsx server/portal/index.ts
+
+🧪 Testing Your Fixes
+Test 1: Portal Authentication
+Open browser console on portal (port 4200), run:
+javascriptfetch('/api/health', {
+  headers: { 'X-Portal-Secret': 'IraCoreApp1!' }
+})
+.then(r => r.json())
+.then(console.log)
+// Should see: { ok: true, ... }
+Test 2: System AI Status
+javascriptfetch('/api/system-ai/status', {
+  headers: { 'X-Portal-Secret': 'IraCoreApp1!' }
+})
+.then(r => r.json())
+.then(console.log)
+// Should see system AI status, not an error
+Test 3: Maintenance Status
+javascriptfetch('/api/maintenance/status', {
+  headers: { 'X-Portal-Secret': 'IraCoreApp1!' }
+})
+.then(r => r.json())
+.then(console.log)
+// Should see maintenance status
+Test 4: Click Portal Buttons
+
+Open portal dashboard
+Click "System AI Status" button
+Click "Run Cleanup" button
+Click "Create Snapshot" button
+
+All should work without errors!
+
+📋 Checklist
+
+ Updated server/middleware/portal-auth.ts
+ Fixed System AI routes with requirePortalOrRole
+ Fixed Maintenance routes with requirePortalOrRole
+ Updated portal frontend to send X-Portal-Secret header
+ Verified PORTAL_SECRET matches in .env files
+ Restarted backend server
+ Restarted portal server
+ Tested with browser console
+ Tested clicking portal buttons
+ Verified no "not allowed via portal" errors
+
+
+🚨 Common Issues
+Issue: "Invalid portal secret"
+Cause: PORTAL_SECRET mismatch
+Fix: Check that .env values match exactly (case-sensitive!)
+Issue: "Missing X-Portal-Secret header"
+Cause: Frontend not sending header
+Fix: Use portalApiClient.ts or add header manually to all fetch calls
+Issue: Still getting 403 errors
+Cause: Route not updated with new middleware
+Fix: Check that route uses requirePortalOrRole not just requireAuth
+Issue: CORS errors
+Cause: Portal (4200) can't reach API (3001)
+Fix: Update CORS config in server/index.ts:
+typescriptapp.use(cors({
+  origin: ['http://localhost:4200', 'http://localhost:5000'],
+  credentials: true
+}));

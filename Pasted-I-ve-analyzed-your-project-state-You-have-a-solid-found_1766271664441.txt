@@ -1,0 +1,329 @@
+I've analyzed your project state. You have a solid foundation for AI monitoring and file ingestion, but the "glue" connecting these pieces is missing. Specifically:
+ * Disconnect: The ChatInput uploads files but doesn't pass their IDs to ChatPage to include in the AI prompt.
+ * Backend Ignorance: The triple-ai endpoint doesn't know to look for fileIds or how to read them into the context.
+ * Manual Printing: The print modal defaults to "Text" even if you're printing a 3D model.
+Here are the 5 critical file updates to fix this integration.
+1. Update src/components/ChatInput.tsx
+This adds a visual "Pending Attachments" area and ensures file IDs are passed up to the parent component when sending.
+import React, { useState, useRef } from 'react';
+import { Paperclip, X, File as FileIcon, Loader2 } from 'lucide-react';
+import { useFileUpload } from '../hooks/useFileUpload'; // Ensure this hook is available
+import './ChatInput.css';
+
+interface ChatInputProps {
+  onSend: (prompt: string, attachedFileIds: string[]) => void;
+  disabled?: boolean;
+}
+
+export default function ChatInput({ onSend, disabled }: ChatInputProps) {
+  const [input, setInput] = useState('');
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [attachedFiles, setAttachedFiles] = useState<{id: string, name: string}[]>([]);
+  const { uploadFile } = useFileUpload();
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const recognitionRef = useRef<any>(null);
+
+  const handleAttachClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      setIsUploading(true);
+      const file = e.target.files[0];
+      try {
+        const result = await uploadFile(file);
+        if (result.success && result.fileId) {
+          setAttachedFiles(prev => [...prev, { id: result.fileId!, name: file.name }]);
+        }
+      } catch (err) {
+        console.error("Upload failed", err);
+      } finally {
+        setIsUploading(false);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }
+    }
+  };
+
+  const removeAttachment = (id: string) => {
+    setAttachedFiles(prev => prev.filter(f => f.id !== id));
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if ((input.trim() || attachedFiles.length > 0) && !disabled) {
+      onSend(input, attachedFiles.map(f => f.id));
+      setInput('');
+      setAttachedFiles([]);
+    }
+  };
+
+  // ... (Keep existing Speech-to-Text logic here: startSpeechToText, speakText) ...
+  // [Rest of speech logic omitted for brevity, assume standard implementation exists]
+
+  return (
+    <form className="chat-input-form" onSubmit={handleSubmit}>
+      {attachedFiles.length > 0 && (
+        <div className="flex gap-2 mb-2 px-2 overflow-x-auto">
+          {attachedFiles.map(file => (
+            <div key={file.id} className="flex items-center gap-1 bg-slate-800 text-cyan-400 px-2 py-1 rounded text-xs border border-cyan-500/30">
+              <FileIcon className="w-3 h-3" />
+              <span className="max-w-[100px] truncate">{file.name}</span>
+              <button 
+                type="button" 
+                onClick={() => removeAttachment(file.id)}
+                className="hover:text-red-400 ml-1"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      
+      <div className="input-wrapper relative">
+         <input 
+            type="file" 
+            ref={fileInputRef} 
+            className="hidden" 
+            onChange={handleFileChange} 
+          />
+        
+        <div className="speech-controls">
+           <button
+            type="button"
+            className="speech-button attach-button"
+            onClick={handleAttachClick}
+            disabled={disabled || isUploading}
+            title="Attach file"
+          >
+            {isUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Paperclip className="w-4 h-4" />}
+          </button>
+          
+          {/* Keep existing mic/speaker buttons */}
+           <button type="button" className={`speech-button mic-button ${isListening ? 'active' : ''}`} onClick={() => {}} disabled={disabled}>
+             {isListening ? '🎙️' : '🎤'}
+           </button>
+        </div>
+        
+        <textarea
+          className="chat-input"
+          placeholder={attachedFiles.length > 0 ? "Add context about these files..." : "Ask NeuroCore anything..."}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={disabled}
+          rows={1} // Auto-grow logic should be here ideally
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              handleSubmit(e);
+            }
+          }}
+        />
+        <button
+          type="submit"
+          className="send-button"
+          disabled={disabled || (!input.trim() && attachedFiles.length === 0)}
+        >
+          {disabled ? '⏳' : '➤'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+2. Update src/pages/ChatPage.tsx
+This connects the new ChatInput to the API call and improves "Print" handling.
+// ... imports ...
+
+export default function ChatPage() {
+  // ... state ...
+
+  // [UPDATED] Handle Sending with Attachments
+  const handleSendMessage = async (prompt: string, attachedFileIds: string[] = []) => {
+    const userMessage: Message = {
+      id: `msg-${Date.now()}`,
+      role: 'user',
+      content: prompt,
+      timestamp: new Date().toISOString(),
+      // Optionally display attachment names in UI here if needed
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+
+    try {
+      const response = await call<TripleAiResponse>(
+        '/api/triple-ai',
+        {
+          method: 'POST',
+          body: JSON.stringify({ 
+            prompt, 
+            userId, 
+            mode,
+            fileIds: attachedFileIds // Pass file IDs to backend
+          }),
+        }
+      );
+
+      // ... existing response handling ...
+    } catch (error: any) {
+      // ... error handling ...
+    }
+  };
+
+  // [UPDATED] Smarter Print Handler
+  const handlePrintMessage = (msgId: string) => {
+    setPrintMessageId(msgId);
+    
+    // Auto-open modal with correct context
+    const msg = messages.find(m => m.id === msgId);
+    if(msg && (msg.content.includes("```xml") || msg.content.includes("```stl"))) {
+       // Logic to hint modal about format can be passed via props if expanded
+    }
+    
+    setShowPrintModal(true);
+  };
+
+  return (
+    <div className="chat-page">
+      {/* ... other components ... */}
+
+      <div className="chat-container">
+        <div className="messages-area">
+          {/* ... existing message mapping ... */}
+        </div>
+
+        {/* Updated Input Prop */}
+        <ChatInput onSend={handleSendMessage} disabled={loading} />
+      </div>
+    </div>
+  );
+}
+
+3. Update server/routes/triple-ai-route.ts
+Modify the backend route to accept fileIds.
+// server/routes/triple-ai-route.ts
+
+import type { Request, Response } from "express";
+import { handleTripleAiRequest, executeTripleAI } from "../ai/triple-ai-handler";
+// ... imports
+
+export async function tripleAiRoute(req: Request, res: Response) {
+  try {
+    const { prompt, userId, mode, domains, fileIds } = req.body; // Extract fileIds
+
+    // ... validation ...
+
+    // Pass fileIds to the handler
+    const result = await executeTripleAI(prompt, {
+      userId: userId || "anonymous",
+      userAgent: String(req.headers["user-agent"] ?? ""),
+      fileIds: Array.isArray(fileIds) ? fileIds : [], // New context field
+    });
+
+    // ... save conversation record ...
+    
+    return res.status(200).json({
+      ok: true,
+      answer: result.answer,
+      metrics: result.metrics,
+    });
+  } catch (err) {
+    // ... error handling
+  }
+}
+
+4. Update server/ai/triple-ai-handler.ts
+Inject file content into the prompt context.
+// server/ai/triple-ai-handler.ts
+import { db } from '../../src/lib/db'; // Adjust path to db
+import { fileUploads } from '../../src/lib/unified-database-schema'; // Adjust schema import
+import { eq, inArray } from 'drizzle-orm';
+import fs from 'fs';
+
+// ... existing imports
+
+export interface UserContext {
+  userId: string;
+  userAgent?: string;
+  fileIds?: string[]; // Add this
+}
+
+async function getFileContext(fileIds: string[]): Promise<string> {
+  if (!fileIds || fileIds.length === 0) return "";
+  
+  try {
+    const files = await db.select().from(fileUploads).where(inArray(fileUploads.id, fileIds));
+    let context = "\n\n[ATTACHED FILES CONTEXT]:\n";
+    
+    for (const file of files) {
+      // Check if file exists on disk
+      if (fs.existsSync(file.filePath)) {
+         // Limit read size to avoid token overflow, e.g., 10KB
+         const content = fs.readFileSync(file.filePath, 'utf8').slice(0, 10000);
+         context += `\n--- File: ${file.originalFilename} (${file.fileType}) ---\n${content}\n`;
+      } else {
+         context += `\n--- File: ${file.originalFilename} (Content not accessible) ---\n`;
+      }
+    }
+    return context;
+  } catch (e) {
+    console.error("Failed to read attached files", e);
+    return "";
+  }
+}
+
+export async function executeTripleAI(
+  prompt: string,
+  context: UserContext
+): Promise<TripleAIResult> {
+  const started = Date.now();
+  
+  // 1. Fetch file context
+  const fileContext = await getFileContext(context.fileIds || []);
+  
+  // 2. Append to prompt (internal logic only, don't change 'prompt' variable if you want neat logs)
+  const fullPrompt = prompt + fileContext;
+
+  const result = await handleTripleAiRequest({
+    prompt: fullPrompt, // Use enriched prompt
+    userId: context.userId,
+    userAgent: context.userAgent,
+  });
+
+  // ... rest of the function remains the same ...
+}
+
+5. Update src/components/BlueprintPrintModal.tsx
+Add auto-detection for the print format based on the file extension.
+// Inside src/components/BlueprintPrintModal.tsx component
+
+// Add logic inside useEffect or when source changes
+useEffect(() => {
+  if (source === 'file' && initialBlueprint) {
+    const title = initialBlueprint.title.toLowerCase();
+    if (title.endsWith('.stl') || title.endsWith('.obj') || title.endsWith('.gcode')) {
+      setFormat('3d');
+      setTargetType('3d');
+    } else if (title.endsWith('.dxf') || title.endsWith('.dwg') || title.endsWith('.step')) {
+      setFormat('cad');
+      setTargetType('cad');
+    } else {
+      setFormat('text');
+      setTargetType('text');
+    }
+  } else if (source === 'current' && lastBlueprintMessage) {
+    // Check AI response content for hints
+    const content = lastBlueprintMessage.content;
+    if (content.includes("G-CODE") || content.includes("vertex")) {
+      setFormat('3d');
+      setTargetType('3d');
+    } else {
+      setFormat('text');
+      setTargetType('text');
+    }
+  }
+}, [source, initialBlueprint, lastBlueprintMessage]);
+

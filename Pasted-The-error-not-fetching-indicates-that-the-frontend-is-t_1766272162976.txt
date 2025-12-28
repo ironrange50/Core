@@ -1,0 +1,960 @@
+The error "not fetching" indicates that the frontend is trying to call the backend API but failing to connect. This is typically caused by the API URL hardcoding to http://localhost:3001, which fails in deployed environments (like Replit) or when accessing the app from a different device on the network.
+Here are the fixes to correct the API connection strings and improve the "Quick Actions" UX to auto-run when clicked.
+1. Fix API Connection in Creator System Hook
+This is the root cause of the "not fetching" error. By setting the default to an empty string '', the request will use the current browser origin (handled by the Vite proxy in dev or Express in prod), ensuring it works in all environments.
+File: src/hooks/useCreatorSystem.ts
+import { useState, useCallback } from 'react';
+
+interface OptimizationRun {
+  id: string;
+  timestamp: string;
+  prompt: string;
+  analysisText: string;
+  recommendations: string[];
+  affectedFiles: string[];
+  status: 'pending' | 'approved' | 'rejected' | 'applied';
+  changes?: any[];
+  riskLevel?: 'low' | 'medium' | 'high';
+  estimatedImpact?: string;
+}
+
+interface CreatorSystemStatus {
+  systemAI: {
+    provider: string;
+    primaryModel: string;
+    backupModel: string;
+    apiKeyConfigured: boolean;
+  };
+  brainAI: any;
+  optimizationStats: {
+    totalRuns: number;
+    pendingRuns: number;
+    appliedRuns: number;
+    rejectedRuns: number;
+  };
+}
+
+interface RollbackPoint {
+  id: string;
+  timestamp: string;
+  runId: string;
+  description: string;
+  fileCount: number;
+}
+
+// [UPDATED] Changed default from localhost:3001 to empty string for relative paths
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
+export function useCreatorSystem() {
+  const [runs, setRuns] = useState<OptimizationRun[]>([]);
+  const [status, setStatus] = useState<CreatorSystemStatus | null>(null);
+  const [rollbackHistory, setRollbackHistory] = useState<RollbackPoint[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleError = (err: any) => {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    setError(message);
+    console.error('[CreatorSystem]', message);
+  };
+
+  const analyzeCode = useCallback(async (prompt: string, scope?: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, scope }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      await refreshRuns();
+      return data;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const startOptimization = useCallback(async (prompt: string, scope?: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, scope }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      await refreshRuns();
+      return data.run;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const proposeChanges = useCallback(async (prompt: string, filePath?: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/propose-change`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, filePath }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      return data;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const applyChanges = useCallback(async (filePath: string, originalCode: string, newCode: string, reason?: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/apply-change`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath, originalCode, newCode, reason }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      await refreshRollbackHistory();
+      return data;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const approveRun = useCallback(async (runId: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/runs/${runId}/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      await refreshRuns();
+      return data;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const rejectRun = useCallback(async (runId: string, reason?: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/runs/${runId}/reject`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      await refreshRuns();
+      return data;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const rollback = useCallback(async (rollbackId: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rollbackId }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      await refreshRollbackHistory();
+      return data;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const generateCode = useCallback(async (prompt: string, targetFiles?: string[]) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/generate-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, targetFiles }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      return data;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/status`);
+      const data = await response.json();
+      if (data.ok) {
+        setStatus(data);
+      }
+    } catch (err) {
+      console.error('Failed to refresh status:', err);
+    }
+  }, []);
+
+  const refreshRuns = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/runs`);
+      const data = await response.json();
+      if (data.ok) {
+        setRuns(data.runs || []);
+      }
+    } catch (err) {
+      console.error('Failed to refresh runs:', err);
+    }
+  }, []);
+
+  const refreshRollbackHistory = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/rollback-history`);
+      const data = await response.json();
+      if (data.ok) {
+        setRollbackHistory(data.rollbacks || data.history || []);
+      }
+    } catch (err) {
+      console.error('Failed to refresh rollback history:', err);
+    }
+  }, []);
+
+  const discoverCode = useCallback(async (query: string, scope?: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({ query });
+      if (scope) params.set('scope', scope);
+      const response = await fetch(`${API_BASE}/api/creator/system-ai/code-discover?${params}`);
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error);
+      return data;
+    } catch (err) {
+      handleError(err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  return {
+    runs,
+    status,
+    rollbackHistory,
+    loading,
+    error,
+    analyzeCode,
+    startOptimization,
+    proposeChanges,
+    applyChanges,
+    approveRun,
+    rejectRun,
+    rollback,
+    generateCode,
+    discoverCode,
+    refreshStatus,
+    refreshRuns,
+    refreshRollbackHistory,
+  };
+}
+
+2. Update Systems AI Panel (Auto-Submit Actions)
+I've updated the "Quick Actions" buttons to automatically trigger the analysis when clicked, instead of just populating the text field. This matches the user expectation of "running an action".
+File: src/components/SystemsAIPanel.tsx
+import { useState, useEffect } from "react";
+import { useCreatorSystem } from "../hooks/useCreatorSystem";
+import { Button } from "./ui/button";
+import {
+  Brain,
+  Wrench,
+  History,
+  Play,
+  Check,
+  X,
+  RotateCcw,
+  AlertTriangle,
+  Loader2,
+  Zap,
+  FileCode,
+  Search,
+} from "lucide-react";
+
+// ... (keep types unchanged) ...
+type TabId = "analyze" | "runs" | "history" | "propose";
+
+interface CodeProposal {
+  filePath: string;
+  analysis: string;
+  codeChanges?: any;
+  proposalId?: string;
+}
+
+export function SystemsAIPanel() {
+  const [activeTab, setActiveTab] = useState<TabId>("analyze");
+  const [prompt, setPrompt] = useState("");
+  const [scope, setScope] = useState("all");
+  const [selectedRun, setSelectedRun] = useState<string | null>(null);
+  const [proposalPrompt, setProposalPrompt] = useState("");
+  const [proposalFilePath, setProposalFilePath] = useState("");
+  const [currentProposal, setCurrentProposal] = useState<CodeProposal | null>(null);
+  const [proposalLoading, setProposalLoading] = useState(false);
+
+  const {
+    runs,
+    status,
+    rollbackHistory,
+    loading,
+    error,
+    analyzeCode,
+    startOptimization,
+    proposeChanges,
+    applyChanges,
+    approveRun,
+    rejectRun,
+    rollback,
+    refreshStatus,
+    refreshRuns,
+    refreshRollbackHistory,
+  } = useCreatorSystem();
+
+  useEffect(() => {
+    refreshStatus();
+    refreshRuns();
+    refreshRollbackHistory();
+  }, []);
+
+  const handleAnalyze = async () => {
+    if (!prompt.trim()) return;
+    try {
+      await startOptimization(prompt, scope);
+      setPrompt("");
+      refreshRuns();
+    } catch (err) {
+      console.error("Analysis failed:", err);
+    }
+  };
+
+  // [UPDATED] Helper for Quick Actions to auto-run
+  const handleQuickAction = async (actionPrompt: string) => {
+    setPrompt(actionPrompt);
+    try {
+      await startOptimization(actionPrompt, scope);
+      setPrompt(""); // Clear after submitting
+      refreshRuns();
+    } catch (err) {
+      console.error("Quick action failed:", err);
+    }
+  };
+
+  const handleApprove = async (runId: string) => {
+    try {
+      await approveRun(runId);
+      refreshRuns();
+    } catch (err) {
+      console.error("Approve failed:", err);
+    }
+  };
+
+  const handleReject = async (runId: string) => {
+    try {
+      await rejectRun(runId, "User rejected");
+      refreshRuns();
+    } catch (err) {
+      console.error("Reject failed:", err);
+    }
+  };
+
+  const handleRollback = async (rollbackId: string) => {
+    try {
+      await rollback(rollbackId);
+      refreshRollbackHistory();
+    } catch (err) {
+      console.error("Rollback failed:", err);
+    }
+  };
+
+  const handlePropose = async () => {
+    if (!proposalPrompt.trim()) return;
+    setProposalLoading(true);
+    try {
+      const result = await proposeChanges(proposalPrompt, proposalFilePath || undefined);
+      setCurrentProposal({
+        filePath: result.filePath,
+        analysis: result.analysis,
+        codeChanges: result.codeChanges,
+        proposalId: result.proposalId,
+      });
+    } catch (err) {
+      console.error("Propose failed:", err);
+    } finally {
+      setProposalLoading(false);
+    }
+  };
+
+  const handleApplyProposal = async () => {
+    if (!currentProposal || !currentProposal.codeChanges) return;
+    try {
+      const originalCode = currentProposal.codeChanges.original || "";
+      const newCode = currentProposal.codeChanges.modified || currentProposal.codeChanges.newCode || "";
+      await applyChanges(currentProposal.filePath, originalCode, newCode, proposalPrompt);
+      setCurrentProposal(null);
+      setProposalPrompt("");
+      setProposalFilePath("");
+      refreshRollbackHistory();
+    } catch (err) {
+      console.error("Apply failed:", err);
+    }
+  };
+
+  const tabs = [
+    { id: "analyze" as TabId, label: "Analyze & Optimize", icon: Brain },
+    { id: "propose" as TabId, label: "Propose Changes", icon: FileCode },
+    { id: "runs" as TabId, label: "Optimization Runs", icon: Zap },
+    { id: "history" as TabId, label: "Rollback History", icon: History },
+  ];
+
+  return (
+    <div className="systems-ai-panel" style={{ padding: "1.5rem" }}>
+      {/* ... (Header and Tabs code remain same) ... */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginBottom: "1.5rem",
+        }}
+      >
+        <h2
+          style={{
+            fontSize: "1.5rem",
+            fontWeight: 700,
+            color: "var(--accent-cyan)",
+            display: "flex",
+            alignItems: "center",
+            gap: "0.75rem",
+          }}
+        >
+          <Brain className="w-6 h-6" />
+          Systems AI
+        </h2>
+        {status && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.5rem",
+              fontSize: "0.75rem",
+              color: "var(--text-secondary)",
+            }}
+          >
+            <span
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: "50%",
+                backgroundColor: status.systemAI?.apiKeyConfigured ? "#22c55e" : "#ef4444",
+              }}
+            />
+            {status.systemAI?.provider || "AI"} Ready
+          </div>
+        )}
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          gap: "0.5rem",
+          marginBottom: "1.5rem",
+          borderBottom: "1px solid rgba(100, 116, 139, 0.3)",
+          paddingBottom: "1rem",
+        }}
+      >
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.5rem",
+              padding: "0.625rem 1.25rem",
+              fontSize: "0.875rem",
+              fontWeight: 500,
+              borderRadius: "9999px",
+              border: "none",
+              cursor: "pointer",
+              transition: "all 0.2s",
+              backgroundColor: activeTab === tab.id ? "var(--accent-cyan)" : "transparent",
+              color: activeTab === tab.id ? "white" : "var(--text-secondary)",
+            }}
+          >
+            <tab.icon className="w-4 h-4" />
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {error && (
+        <div
+          style={{
+            padding: "1rem",
+            borderRadius: "0.5rem",
+            backgroundColor: "rgba(239, 68, 68, 0.1)",
+            border: "1px solid rgba(239, 68, 68, 0.3)",
+            color: "#fca5a5",
+            marginBottom: "1rem",
+            display: "flex",
+            alignItems: "center",
+            gap: "0.5rem",
+          }}
+        >
+          <AlertTriangle className="w-4 h-4" />
+          {error}
+        </div>
+      )}
+
+      {activeTab === "analyze" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
+          {/* ... (Analysis Textarea section same as before) ... */}
+           <div
+            style={{
+              backgroundColor: "rgba(15, 23, 42, 0.6)",
+              borderRadius: "0.75rem",
+              padding: "1.5rem",
+              border: "1px solid rgba(100, 116, 139, 0.2)",
+            }}
+          >
+            <h3 style={{ fontSize: "1rem", fontWeight: 600, color: "var(--text-primary)", marginBottom: "1rem" }}>
+              Code Analysis & Optimization
+            </h3>
+
+            <div style={{ marginBottom: "1rem" }}>
+              <label style={{ display: "block", fontSize: "0.75rem", fontWeight: 500, color: "var(--text-secondary)", marginBottom: "0.5rem" }}>
+                Describe what you want to optimize or fix:
+              </label>
+              <textarea
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                placeholder="e.g., Optimize database queries for better performance, Fix memory leaks in the WebSocket handler..."
+                style={{
+                  width: "100%",
+                  minHeight: "100px",
+                  padding: "0.75rem",
+                  borderRadius: "0.5rem",
+                  backgroundColor: "rgba(30, 41, 59, 0.8)",
+                  border: "1px solid rgba(100, 116, 139, 0.3)",
+                  color: "var(--text-primary)",
+                  fontSize: "0.875rem",
+                  resize: "vertical",
+                }}
+              />
+            </div>
+
+            <div style={{ display: "flex", gap: "1rem", alignItems: "flex-end" }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ display: "block", fontSize: "0.75rem", fontWeight: 500, color: "var(--text-secondary)", marginBottom: "0.5rem" }}>Scope:</label>
+                <select
+                  value={scope}
+                  onChange={(e) => setScope(e.target.value)}
+                  style={{
+                    width: "100%",
+                    padding: "0.625rem",
+                    borderRadius: "9999px",
+                    backgroundColor: "rgba(30, 41, 59, 0.8)",
+                    border: "1px solid rgba(100, 116, 139, 0.3)",
+                    color: "var(--text-primary)",
+                    fontSize: "0.875rem",
+                  }}
+                >
+                  <option value="all">All Code</option>
+                  <option value="server">Server Only</option>
+                  <option value="client">Client Only</option>
+                  <option value="api">API Routes</option>
+                  <option value="components">Components</option>
+                </select>
+              </div>
+
+              <Button onClick={handleAnalyze} disabled={loading || !prompt.trim()}>
+                {loading ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Analyzing...
+                  </>
+                ) : (
+                  <>
+                    <Search className="w-4 h-4 mr-2" />
+                    Analyze & Optimize
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+
+          {/* Quick Actions Section */}
+          <div
+            style={{
+              backgroundColor: "rgba(15, 23, 42, 0.6)",
+              borderRadius: "0.75rem",
+              padding: "1.5rem",
+              border: "1px solid rgba(100, 116, 139, 0.2)",
+            }}
+          >
+            <h3
+              style={{
+                fontSize: "1rem",
+                fontWeight: 600,
+                color: "var(--text-primary)",
+                marginBottom: "1rem",
+              }}
+            >
+              Quick Actions
+            </h3>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "0.75rem" }}>
+              {[
+                { label: "Health Check", prompt: "Run a comprehensive system health check" },
+                { label: "Performance Audit", prompt: "Identify and optimize performance bottlenecks" },
+                { label: "Security Scan", prompt: "Scan for security vulnerabilities and issues" },
+                { label: "Code Quality", prompt: "Review code quality and suggest improvements" },
+              ].map((action) => (
+                <Button
+                  key={action.label}
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handleQuickAction(action.prompt)}
+                  disabled={loading}
+                >
+                  {loading ? <Loader2 className="w-3 h-3 mr-2 animate-spin" /> : null}
+                  {action.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ... (Propose, Runs, History tabs remain same) ... */}
+      {activeTab === "propose" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
+          {/* ... */}
+           <div style={{ backgroundColor: "rgba(15, 23, 42, 0.6)", borderRadius: "0.75rem", padding: "1.5rem", border: "1px solid rgba(100, 116, 139, 0.2)" }}>
+            <h3 style={{ fontSize: "1rem", fontWeight: 600, color: "var(--text-primary)", marginBottom: "1rem" }}>Propose Code Changes</h3>
+            <div style={{ marginBottom: "1rem" }}>
+              <label style={{ display: "block", fontSize: "0.75rem", fontWeight: 500, color: "var(--text-secondary)", marginBottom: "0.5rem" }}>Describe the changes you want:</label>
+              <textarea value={proposalPrompt} onChange={(e) => setProposalPrompt(e.target.value)} placeholder="e.g., Add input validation to the login form..." style={{ width: "100%", minHeight: "100px", padding: "0.75rem", borderRadius: "0.5rem", backgroundColor: "rgba(30, 41, 59, 0.8)", border: "1px solid rgba(100, 116, 139, 0.3)", color: "var(--text-primary)", fontSize: "0.875rem", resize: "vertical" }} />
+            </div>
+            <div style={{ marginBottom: "1rem" }}>
+              <label style={{ display: "block", fontSize: "0.75rem", fontWeight: 500, color: "var(--text-secondary)", marginBottom: "0.5rem" }}>Target File Path (optional):</label>
+              <input type="text" value={proposalFilePath} onChange={(e) => setProposalFilePath(e.target.value)} placeholder="e.g., src/components/LoginForm.tsx" style={{ width: "100%", padding: "0.625rem", borderRadius: "9999px", backgroundColor: "rgba(30, 41, 59, 0.8)", border: "1px solid rgba(100, 116, 139, 0.3)", color: "var(--text-primary)", fontSize: "0.875rem" }} />
+            </div>
+            <Button onClick={handlePropose} disabled={proposalLoading || !proposalPrompt.trim()}>
+              {proposalLoading ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Generating Proposal...</> : <><FileCode className="w-4 h-4 mr-2" /> Generate Proposal</>}
+            </Button>
+          </div>
+          {currentProposal && (
+            <div style={{ backgroundColor: "rgba(15, 23, 42, 0.6)", borderRadius: "0.75rem", padding: "1.5rem", border: "1px solid rgba(34, 197, 94, 0.3)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+                <h3 style={{ fontSize: "1rem", fontWeight: 600, color: "var(--text-primary)" }}>Proposed Changes</h3>
+                <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>{currentProposal.filePath}</span>
+              </div>
+              <div style={{ padding: "1rem", borderRadius: "0.5rem", backgroundColor: "rgba(30, 41, 59, 0.6)", marginBottom: "1rem", maxHeight: "300px", overflow: "auto" }}>
+                <p style={{ fontSize: "0.875rem", color: "var(--text-primary)", whiteSpace: "pre-wrap" }}>{currentProposal.analysis}</p>
+              </div>
+              <div style={{ display: "flex", gap: "0.75rem" }}>
+                <Button onClick={handleApplyProposal} disabled={loading || !currentProposal.codeChanges}><Check className="w-4 h-4 mr-2" /> Apply Changes</Button>
+                <Button variant="outline" onClick={() => setCurrentProposal(null)}><X className="w-4 h-4 mr-2" /> Discard</Button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      
+      {activeTab === "runs" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+           {/* Runs rendering logic remains same */}
+           {runs.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "3rem", color: "var(--text-secondary)" }}>
+              <Zap className="w-12 h-12 mx-auto mb-2 opacity-30" />
+              <p>No optimization runs yet.</p>
+              <p style={{ fontSize: "0.875rem" }}>Start an analysis to create your first run.</p>
+            </div>
+          ) : (
+            runs.map((run: any) => (
+              <div key={run.id} style={{ backgroundColor: "rgba(15, 23, 42, 0.6)", borderRadius: "0.75rem", padding: "1.25rem", border: `1px solid ${run.status === "applied" ? "rgba(34, 197, 94, 0.3)" : run.status === "rejected" ? "rgba(239, 68, 68, 0.3)" : "rgba(100, 116, 139, 0.2)"}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "0.75rem" }}>
+                  <div>
+                    <p style={{ fontSize: "0.875rem", fontWeight: 600, color: "var(--text-primary)", marginBottom: "0.25rem" }}>{run.prompt?.slice(0, 80)}{run.prompt?.length > 80 ? "..." : ""}</p>
+                    <p style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>{new Date(run.timestamp).toLocaleString()}</p>
+                  </div>
+                  <span style={{ padding: "0.25rem 0.75rem", borderRadius: "9999px", fontSize: "0.75rem", fontWeight: 500, backgroundColor: run.status === "pending" ? "rgba(251, 191, 36, 0.2)" : run.status === "approved" ? "rgba(59, 130, 246, 0.2)" : run.status === "applied" ? "rgba(34, 197, 94, 0.2)" : "rgba(239, 68, 68, 0.2)", color: run.status === "pending" ? "#fbbf24" : run.status === "approved" ? "#60a5fa" : run.status === "applied" ? "#4ade80" : "#f87171" }}>{run.status.charAt(0).toUpperCase() + run.status.slice(1)}</span>
+                </div>
+                {run.analysisText && <p style={{ fontSize: "0.8125rem", color: "var(--text-secondary)", marginBottom: "0.75rem", lineHeight: 1.5 }}>{run.analysisText.slice(0, 200)}{run.analysisText.length > 200 ? "..." : ""}</p>}
+                {run.status === "pending" && (
+                  <div style={{ display: "flex", gap: "0.5rem" }}>
+                    <Button size="sm" onClick={() => handleApprove(run.id)} disabled={loading}><Check className="w-3.5 h-3.5 mr-1" /> Approve</Button>
+                    <Button size="sm" variant="destructive" onClick={() => handleReject(run.id)} disabled={loading}><X className="w-3.5 h-3.5 mr-1" /> Reject</Button>
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+       {activeTab === "history" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+          {rollbackHistory.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "3rem", color: "var(--text-secondary)" }}>
+              <History className="w-12 h-12 mx-auto mb-2 opacity-30" />
+              <p>No rollback history yet.</p>
+              <p style={{ fontSize: "0.875rem" }}>Applied changes will appear here for rollback.</p>
+            </div>
+          ) : (
+            rollbackHistory.map((point: any) => (
+              <div key={point.id} style={{ backgroundColor: "rgba(15, 23, 42, 0.6)", borderRadius: "0.75rem", padding: "1.25rem", border: "1px solid rgba(100, 116, 139, 0.2)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <p style={{ fontSize: "0.875rem", fontWeight: 600, color: "var(--text-primary)" }}>{point.description}</p>
+                  <p style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>{new Date(point.timestamp).toLocaleString()} - {point.fileCount} files</p>
+                </div>
+                <Button size="sm" variant="outline" onClick={() => handleRollback(point.id)} disabled={loading}><RotateCcw className="w-3.5 h-3.5 mr-1" /> Rollback</Button>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+3. Fix Learning Metrics Hook
+Apply the same API_BASE fix here to ensure learning data is fetched correctly.
+File: src/hooks/useLearningMetrics.ts
+import { useEffect, useState, useCallback } from 'react';
+
+// ... (interface definitions remain the same) ...
+
+// [UPDATED] Changed from localhost:3001 to empty string
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
+export function useLearningMetrics() {
+  const [samples, setSamples] = useState<LearningSample[]>([]);
+  const [stats, setStats] = useState<LearningStats | null>(null);
+  const [insights, setInsights] = useState<LearningInsights | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const evtSource = new EventSource(`${API_BASE}/api/admin/learning-stream`);
+
+    evtSource.onmessage = (e) => {
+      try {
+        const data: LearningSample = JSON.parse(e.data);
+        setSamples((prev) => [...prev.slice(-59), data]);
+      } catch {
+      }
+    };
+
+    evtSource.onerror = () => {
+      evtSource.close();
+    };
+
+    return () => evtSource.close();
+  }, []);
+
+  const trackEvent = useCallback(async (
+    eventType: 'interaction' | 'optimization' | 'error' | 'success',
+    category: string,
+    value: number = 1,
+    metadata: Record<string, any> = {}
+  ) => {
+    try {
+      const response = await fetch(`${API_BASE}/api/learning/track`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eventType, category, value, metadata }),
+      });
+      const data = await response.json();
+      if (!data.success) throw new Error(data.error);
+      return data.metricId;
+    } catch (err) {
+      console.error('Failed to track event:', err);
+      throw err;
+    }
+  }, []);
+
+  const fetchStats = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/learning/stats`);
+      const data = await response.json();
+      if (data.success) {
+        setStats(data.stats);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch stats');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // ... (rest of the file remains the same) ...
+
+  const fetchInsights = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/learning/insights`);
+      const data = await response.json();
+      if (data.success) {
+        setInsights(data.insights);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch insights');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const fetchMetrics = useCallback(async (params?: {
+    eventType?: string;
+    category?: string;
+    startDate?: string;
+    endDate?: string;
+    limit?: number;
+  }) => {
+    setLoading(true);
+    try {
+      const searchParams = new URLSearchParams();
+      if (params?.eventType) searchParams.set('eventType', params.eventType);
+      if (params?.category) searchParams.set('category', params.category);
+      if (params?.startDate) searchParams.set('startDate', params.startDate);
+      if (params?.endDate) searchParams.set('endDate', params.endDate);
+      if (params?.limit) searchParams.set('limit', String(params.limit));
+      
+      const response = await fetch(`${API_BASE}/api/learning/metrics?${searchParams}`);
+      const data = await response.json();
+      return data.metrics as LearningMetric[];
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch metrics');
+      return [];
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const fetchSummary = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/learning/summary`);
+      const data = await response.json();
+      return data.summary;
+    } catch (err) {
+      console.error('Failed to fetch summary:', err);
+      return null;
+    }
+  }, []);
+
+  return {
+    samples,
+    stats,
+    insights,
+    loading,
+    error,
+    trackEvent,
+    fetchStats,
+    fetchInsights,
+    fetchMetrics,
+    fetchSummary,
+  };
+}
+
+4. Fix Admin Devices Panel
+Fixing the hardcoded backendUrl which might cause issues in environments where localhost isn't appropriate.
+File: src/components/AdminDevicesPanel.tsx
+import React from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+
+// ... (Types remain same) ...
+type DeviceType = 'server' | 'printer2d' | 'printer3d';
+type DeviceStatus = 'online' | 'offline' | 'unknown';
+
+interface Device {
+  id: string;
+  type: DeviceType;
+  host: string;
+  port?: number;
+  name?: string;
+  status: DeviceStatus;
+  capabilities: string[];
+}
+
+interface EnvironmentScan {
+  networks: { interface: string; address: string; family: string }[];
+  servers: { host: string; port: number; reachable: boolean }[];
+  printers: { name: string; isDefault: boolean }[];
+  timestamp: string;
+}
+
+interface AdminDevicesData {
+  environment: EnvironmentScan | null;
+  devices: Device[];
+}
+
+// [UPDATED] Changed to relative path by default
+async function apiRequest(method: string, endpoint: string, body?: any) {
+  const backendUrl = import.meta.env.VITE_API_URL || '';
+  const res = await fetch(`${backendUrl}${endpoint}`, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return res.json();
+}
+
+// ... (Rest of the component remains same) ...
+function DeviceIcon({ type, status }: { type: DeviceType; status: DeviceStatus }) {
+  // ...
+}
+
+export function AdminDevicesPanel() {
+  // ...
+}
+

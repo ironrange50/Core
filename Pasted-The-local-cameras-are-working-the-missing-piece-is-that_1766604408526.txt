@@ -1,0 +1,157 @@
+The local cameras are working; the missing piece is that **remote tracks are not being delivered/rendered**, which points to an ICE/SDP wiring issue or the `ontrack` handler not being hit on either side.[1][2][3][4]
+
+## 1. What this behavior means
+
+Given:
+
+- On each device you see your **own** video in the small PiP window.  
+- The large remote video element is black on both sides.  
+- No permission errors now.
+
+That tells us:
+
+- `getUserMedia` is succeeding and local tracks are attached to the peer connection on both ends.  
+- The WebRTC connection is either:
+  - Not fully established (ICE never finds a working path, especially if both are behind NAT), or  
+  - Established, but `ontrack` is not being fired / not attaching the remote stream correctly.[2][3][4][1]
+
+With only a public STUN server and no TURN, **some laptop ↔ mobile paths will fail to find a route**, so you get exactly this “local preview OK, remote black” symptom.[3][4]
+
+So there are two concrete actions:
+
+1. **Verify with logging whether `ontrack` ever fires** and what the connection state is.  
+2. **Add a TURN server** (even a free/demo one) to test if the issue is purely NAT traversal.
+
+## 2. Add logging so you can see connection state
+
+In `useP2PCall.ts`, inside `startPeerConnection`, add log lines:
+
+```ts
+pc.oniceconnectionstatechange = () => {
+  console.log("[WebRTC] iceConnectionState:", pc.iceConnectionState);
+};
+
+pc.onconnectionstatechange = () => {
+  console.log("[WebRTC] connectionState:", pc.connectionState);
+  // existing code…
+};
+```
+
+And in `ontrack`:
+
+```ts
+pc.ontrack = (event) => {
+  console.log("[WebRTC] ontrack fired, streams:", event.streams);
+  const [remoteStream] = event.streams;
+  if (remoteVideoRef.current) {
+    remoteVideoRef.current.srcObject = remoteStream;
+  }
+};
+```
+
+Then:
+
+- Open DevTools on the laptop.  
+- Start a call; watch the console for:
+  - `connectionState: connected`
+  - `iceConnectionState: connected` or `completed`
+  - Whether `[WebRTC] ontrack fired` appears.  
+
+Interpretation:
+
+- **If connectionState never reaches `connected`** and `iceConnectionState` ends at `failed` → NAT traversal issue (need TURN).[4][3]
+- **If connectionState is `connected` but `ontrack` never fires** → signaling bug (offer/answer not fully symmetrical, or tracks added too late).  
+
+## 3. Add TURN to improve NAT traversal
+
+Right now, you only have:
+
+```ts
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+];
+```
+
+Some laptop ↔ phone paths behind routers or mobile networks **require TURN** (relay) to get media through.[3][4]
+
+If you can get any TURN credentials (even a temporary/free one) from a provider (e.g., a simple Coturn instance or a demo from a TURN service), put them in:
+
+```ts
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  {
+    urls: "turn:YOUR_TURN_SERVER:3478",
+    username: "USERNAME",
+    credential: "PASSWORD",
+  },
+];
+```
+
+Then re‑run the test:
+
+- If with TURN you see `connectionState: connected` and remote video appears, you’ve confirmed it was a NAT/relay problem, not wiring.
+
+If you do **not** have TURN right now, you can still proceed with step 2 (logging) to see the state transitions and know for sure.
+
+## 4. Quick code sanity on track wiring
+
+Confirm your `startPeerConnection` logic runs on **both** ends:
+
+- Caller:  
+  - `startCall()` → `startPeerConnection(true)` before sending offer.  
+- Callee:  
+  - When receiving the *first* offer in `call:signal`, if `!pcRef.current`, you call `startPeerConnection(false)` before answering.  
+
+This is in the current code; just ensure you did not accidentally remove the callee’s `startPeerConnection(false)` when you merged patches.
+
+The important parts:
+
+```ts
+if (!pcRef.current) {
+  // we are callee
+  await startPeerConnection(false);
+}
+const pc = pcRef.current!;
+if (data.type === "offer") {
+  await pc.setRemoteDescription(new RTCSessionDescription(data));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  socket.emit("call:signal", { conversationId, data: answer });
+}
+```
+
+If this is present and `ontrack` still never fires (confirmed by logs), it is almost certainly a network path problem (needs TURN) rather than local wiring.
+
+## 5. What to do next
+
+Concrete next step that does **not** change portal/auth at all:
+
+1. Add the logging described in section 2.  
+2. Try a laptop ↔ laptop call on the **same network** (e.g., both on your home Wi‑Fi):  
+   - If this works and you see each other’s video, but laptop ↔ mobile fails, that again points directly at NAT/firewall/TURN needs.  
+3. If possible, add a TURN server config and retest.  
+
+If you paste:
+
+- The console output for `iceConnectionState` and `connectionState` from a failed laptop ↔ mobile call, and  
+- Whether `ontrack` logged at all,
+
+then the next response can say “it’s 100% a NAT/TURN issue” or “there’s a specific signaling bug at this line” and give a tiny, focused patch rather than more wide changes.
+
+[1](https://stackoverflow.com/questions/66321286/why-does-webrtc-set-up-a-connection-only-after-second-offer)
+[2](https://www.reddit.com/r/WebRTC/comments/k3rmcs/cannot_set_up_a_simple_stable_twoway_call/)
+[3](https://stackoverflow.com/questions/79802906/webrtc-p2p-connection-fails-to-establish-even-with-stun-server-configured)
+[4](https://www.sctheblog.com/blog/webrtc-intro/)
+[5](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/3ddd18d4-1107-4ca6-a598-8a2d2fd61570/COMPLETE-CODEBASE-SNAPSHOT-2025-12-24.md)
+[6](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/e4ade863-433a-47b8-87bc-3d52daae98ab/ira-neuro-complete.md)
+[7](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/484026ce-e4a2-4452-9533-04ea24853bf6/ira-neuro-config.md)
+[8](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d9efe794-0350-49ca-ae82-6b8c2bb74559/ira-neuro-database.md)
+[9](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/7c5f31ca-30f8-4c5c-bd2d-2974ab30e368/JitsiOverlay.tsx)
+[10](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d20276eb-47c2-49c4-b178-eb364ba44d53/ConversationList.tsx)
+[11](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d45efade-97c7-4cde-9ab5-eda036e01548/ChatMetrics.tsx)
+[12](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/85af2b2c-0b25-403d-97e2-6b46c1b47767/ChatMessage.tsx)
+[13](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/138147cc-a238-45e8-9e4a-bd5425abaf44/ChatInput.tsx)
+[14](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/b3d6bf8f-3adb-418c-8b3d-1fd68e0c9aff/Layout.tsx)
+[15](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/9895ee21-cb06-46d7-9503-55c3596f29d0/JitsiOverlay.tsx)
+[16](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/0d794e58-3c42-4ecb-8293-04301791ea2c/metricsRoute.ts)
+[17](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/4678fae1-fd22-4b02-9e1c-1a9ee1fb78d2/messaging.ts)

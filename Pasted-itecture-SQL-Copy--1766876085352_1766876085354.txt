@@ -1,0 +1,629 @@
+itecture · SQL
+Copy
+
+-- ============================================================================
+-- NEUROCORE V2: TRIPLE AI ARCHITECTURE
+-- Brain AI (Iracore) | Heart AI (Code/AI) | System AI (Health)
+-- 18 Brain Nodes (6 per model) | 54 Stacks (3 per node) | Dense Domains
+-- Device Modes: Standard (2-1-1) | Professional (2-2-2) | Advanced (3-3-3)
+-- ============================================================================
+
+-- CORE TABLES
+CREATE TABLE IF NOT EXISTS ai_nodes (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'heart', 'system')),
+  model_slot INTEGER CHECK (model_slot IN (1, 2, 3)),
+  name VARCHAR(128) NOT NULL,
+  label VARCHAR(64) NOT NULL,
+  description TEXT,
+  keywords TEXT[] NOT NULL DEFAULT '{}',
+  priority INTEGER NOT NULL DEFAULT 50,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_stacks (
+  id VARCHAR(64) PRIMARY KEY,
+  node_id VARCHAR(64) NOT NULL REFERENCES ai_nodes(id) ON DELETE CASCADE,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'heart', 'system')),
+  name VARCHAR(128) NOT NULL,
+  label VARCHAR(64) NOT NULL,
+  description TEXT,
+  keywords TEXT[] NOT NULL DEFAULT '{}',
+  priority INTEGER NOT NULL DEFAULT 50,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_domains (
+  id VARCHAR(64) PRIMARY KEY,
+  stack_id VARCHAR(64) NOT NULL REFERENCES ai_stacks(id) ON DELETE CASCADE,
+  node_id VARCHAR(64) NOT NULL REFERENCES ai_nodes(id) ON DELETE CASCADE,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'heart', 'system')),
+  name VARCHAR(128) NOT NULL,
+  description TEXT,
+  keywords TEXT[] NOT NULL DEFAULT '{}',
+  system_prompt TEXT,
+  priority INTEGER NOT NULL DEFAULT 50,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_memories (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'shared')),
+  domain_id VARCHAR(64) REFERENCES ai_domains(id) ON DELETE SET NULL,
+  content TEXT NOT NULL,
+  context JSONB DEFAULT '{}',
+  relevance_score REAL DEFAULT 0.5,
+  usage_count INTEGER DEFAULT 0,
+  last_used_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_tree (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'shared')),
+  parent_id VARCHAR(64) REFERENCES knowledge_tree(id) ON DELETE CASCADE,
+  node_type VARCHAR(32) NOT NULL CHECK (node_type IN ('root', 'branch', 'leaf')),
+  name VARCHAR(256) NOT NULL,
+  content TEXT,
+  metadata JSONB DEFAULT '{}',
+  depth INTEGER NOT NULL DEFAULT 0,
+  path TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_model_config (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'heart', 'system')),
+  model_slot INTEGER NOT NULL CHECK (model_slot IN (1, 2, 3)),
+  provider VARCHAR(64) NOT NULL,
+  model_name VARCHAR(128) NOT NULL,
+  is_primary BOOLEAN DEFAULT FALSE,
+  is_backup BOOLEAN DEFAULT FALSE,
+  priority INTEGER NOT NULL DEFAULT 50,
+  max_tokens INTEGER DEFAULT 1000,
+  temperature REAL DEFAULT 0.7,
+  timeout_ms INTEGER DEFAULT 30000,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(ai_type, model_slot, provider, model_name)
+);
+
+CREATE TABLE IF NOT EXISTS device_profiles (
+  id VARCHAR(64) PRIMARY KEY,
+  device_class VARCHAR(32) NOT NULL CHECK (device_class IN ('mobile', 'tablet', 'laptop', 'desktop', 'server')),
+  default_mode VARCHAR(32) NOT NULL CHECK (default_mode IN ('standard', 'professional', 'advanced')),
+  node_limit INTEGER NOT NULL,
+  stack_limit INTEGER NOT NULL,
+  domain_limit INTEGER NOT NULL,
+  description TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_routing_log (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL,
+  model_slot INTEGER NOT NULL,
+  device_mode VARCHAR(32),
+  prompt_hash VARCHAR(256),
+  selected_nodes TEXT[],
+  selected_stacks TEXT[],
+  selected_domains TEXT[],
+  memories_used INTEGER DEFAULT 0,
+  routing_time_ms INTEGER,
+  confidence REAL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_response_log (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL,
+  device_mode VARCHAR(32),
+  prompt_preview TEXT,
+  model1_response TEXT,
+  model1_time_ms INTEGER,
+  model1_nodes TEXT[],
+  model2_response TEXT,
+  model2_time_ms INTEGER,
+  model2_nodes TEXT[],
+  model3_response TEXT,
+  model3_time_ms INTEGER,
+  model3_nodes TEXT[],
+  knowledge_algorithm_result TEXT,
+  final_answer TEXT,
+  total_time_ms INTEGER,
+  quality_score REAL,
+  user_feedback VARCHAR(32),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- INDEXES
+CREATE INDEX IF NOT EXISTS idx_ai_nodes_type ON ai_nodes(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_nodes_model ON ai_nodes(model_slot);
+CREATE INDEX IF NOT EXISTS idx_ai_nodes_label ON ai_nodes(label);
+CREATE INDEX IF NOT EXISTS idx_ai_nodes_keywords ON ai_nodes USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_ai_stacks_node ON ai_stacks(node_id);
+CREATE INDEX IF NOT EXISTS idx_ai_stacks_label ON ai_stacks(label);
+CREATE INDEX IF NOT EXISTS idx_ai_stacks_keywords ON ai_stacks USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_ai_domains_stack ON ai_domains(stack_id);
+CREATE INDEX IF NOT EXISTS idx_ai_domains_node ON ai_domains(node_id);
+CREATE INDEX IF NOT EXISTS idx_ai_domains_keywords ON ai_domains USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_ai_memories_type ON ai_memories(ai_type);
+CREATE INDEX IF NOT EXISTS idx_knowledge_tree_type ON knowledge_tree(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_model_config_type ON ai_model_config(ai_type);
+
+-- DEVICE PROFILES
+INSERT INTO device_profiles (id, device_class, default_mode, node_limit, stack_limit, domain_limit, description) VALUES
+  ('profile-mobile', 'mobile', 'standard', 2, 1, 1, 'Mobile - Standard (2-1-1) = 2 domains'),
+  ('profile-tablet', 'tablet', 'standard', 2, 1, 1, 'Tablet - Standard (2-1-1) = 2 domains'),
+  ('profile-laptop', 'laptop', 'professional', 2, 2, 2, 'Laptop - Professional (2-2-2) = 4 domains'),
+  ('profile-desktop', 'desktop', 'advanced', 3, 3, 3, 'Desktop - Advanced (3-3-3) = 9 domains'),
+  ('profile-server', 'server', 'advanced', 3, 3, 3, 'Server - Advanced (3-3-3) = 9 domains')
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- MODEL 1: DeepSeek V3 (6 Nodes - Technical/Reasoning)
+-- ============================================================================
+
+-- Node 1: CALCULATIONS
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m1-calc', 'brain', 1, 'Calculations & Math', 'CALCULATIONS', ARRAY['math','calculate','equation','solve','compute','number','arithmetic','algebra'], 100)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m1-calc-algebra', 'brain-m1-calc', 'brain', 'Algebra', 'ALGEBRA', ARRAY['equation','solve','variable','polynomial','linear','quadratic'], 100),
+('brain-m1-calc-calculus', 'brain-m1-calc', 'brain', 'Calculus', 'CALCULUS', ARRAY['derivative','integral','limit','differential','rate','optimization'], 95),
+('brain-m1-calc-numerical', 'brain-m1-calc', 'brain', 'Numerical', 'NUMERICAL', ARRAY['matrix','iteration','approximation','interpolation','regression'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-linear-eq', 'brain-m1-calc-algebra', 'brain-m1-calc', 'brain', 'Linear Equations', ARRAY['linear','equation','solve','variable'], 100),
+('d-quadratic', 'brain-m1-calc-algebra', 'brain-m1-calc', 'brain', 'Quadratic', ARRAY['quadratic','polynomial','roots','factor'], 95),
+('d-systems-eq', 'brain-m1-calc-algebra', 'brain-m1-calc', 'brain', 'Systems', ARRAY['system','simultaneous','matrix','gaussian'], 90),
+('d-derivatives', 'brain-m1-calc-calculus', 'brain-m1-calc', 'brain', 'Derivatives', ARRAY['derivative','rate','slope','differentiate'], 100),
+('d-integrals', 'brain-m1-calc-calculus', 'brain-m1-calc', 'brain', 'Integrals', ARRAY['integral','area','volume','antiderivative'], 95),
+('d-optimization', 'brain-m1-calc-calculus', 'brain-m1-calc', 'brain', 'Optimization', ARRAY['optimize','maximum','minimum','extrema'], 90),
+('d-matrix-ops', 'brain-m1-calc-numerical', 'brain-m1-calc', 'brain', 'Matrix Ops', ARRAY['matrix','determinant','inverse','eigenvalue'], 100),
+('d-interpolation', 'brain-m1-calc-numerical', 'brain-m1-calc', 'brain', 'Interpolation', ARRAY['interpolate','curve fit','spline'], 95),
+('d-regression', 'brain-m1-calc-numerical', 'brain-m1-calc', 'brain', 'Regression', ARRAY['regression','fit','correlation'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 2: CHEMISTRY
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m1-chem', 'brain', 1, 'Chemistry & Compounds', 'CHEMISTRY', ARRAY['chemical','compound','polymer','reaction','formulation','molecule','synthesis'], 95)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m1-chem-polymer', 'brain-m1-chem', 'brain', 'Polymers', 'POLYMERS', ARRAY['polymer','polyurethane','rubber','elastomer','monomer','crosslink'], 100),
+('brain-m1-chem-formulation', 'brain-m1-chem', 'brain', 'Formulations', 'FORMULATIONS', ARRAY['formulation','mix','compound','recipe','batch','ratio'], 95),
+('brain-m1-chem-reaction', 'brain-m1-chem', 'brain', 'Reactions', 'REACTIONS', ARRAY['reaction','cure','bond','crosslink','catalyst','kinetics'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-polyurethane', 'brain-m1-chem-polymer', 'brain-m1-chem', 'brain', 'Polyurethane', ARRAY['polyurethane','urethane','isocyanate','polyol','mdi'], 100),
+('d-rubber-chem', 'brain-m1-chem-polymer', 'brain-m1-chem', 'brain', 'Rubber', ARRAY['rubber','vulcanization','sulfur','accelerator'], 95),
+('d-elastomer-sci', 'brain-m1-chem-polymer', 'brain-m1-chem', 'brain', 'Elastomers', ARRAY['elastomer','neoprene','butyl','nitrile','epdm'], 90),
+('d-compound-design', 'brain-m1-chem-formulation', 'brain-m1-chem', 'brain', 'Compound Design', ARRAY['compound','formulate','design','optimize'], 100),
+('d-mixing', 'brain-m1-chem-formulation', 'brain-m1-chem', 'brain', 'Mixing', ARRAY['mix','batch','blend','disperse'], 95),
+('d-additives', 'brain-m1-chem-formulation', 'brain-m1-chem', 'brain', 'Additives', ARRAY['additive','filler','plasticizer','antioxidant'], 90),
+('d-curing', 'brain-m1-chem-reaction', 'brain-m1-chem', 'brain', 'Curing', ARRAY['cure','crosslink','vulcanize','harden'], 100),
+('d-kinetics', 'brain-m1-chem-reaction', 'brain-m1-chem', 'brain', 'Kinetics', ARRAY['kinetics','rate','activation','arrhenius'], 95),
+('d-catalysis', 'brain-m1-chem-reaction', 'brain-m1-chem', 'brain', 'Catalysis', ARRAY['catalyst','accelerate','inhibit','promote'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 3: PHYSICS
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m1-phys', 'brain', 1, 'Physics & Mechanics', 'PHYSICS', ARRAY['physics','force','energy','thermal','mechanics','dynamics','motion'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m1-phys-thermo', 'brain-m1-phys', 'brain', 'Thermodynamics', 'THERMO', ARRAY['heat','temperature','thermal','conduction','convection'], 100),
+('brain-m1-phys-mech', 'brain-m1-phys', 'brain', 'Mechanics', 'MECHANICS', ARRAY['force','stress','strain','load','pressure','tension'], 95),
+('brain-m1-phys-fluid', 'brain-m1-phys', 'brain', 'Fluids', 'FLUIDS', ARRAY['flow','velocity','viscosity','reynolds','turbulent'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-heat-transfer', 'brain-m1-phys-thermo', 'brain-m1-phys', 'brain', 'Heat Transfer', ARRAY['heat transfer','conduction','convection','radiation'], 100),
+('d-temperature', 'brain-m1-phys-thermo', 'brain-m1-phys', 'brain', 'Temperature', ARRAY['temperature','gradient','cold wall','thermal'], 95),
+('d-energy', 'brain-m1-phys-thermo', 'brain-m1-phys', 'brain', 'Energy', ARRAY['energy','entropy','enthalpy','work'], 90),
+('d-stress', 'brain-m1-phys-mech', 'brain-m1-phys', 'brain', 'Stress', ARRAY['stress','strain','yield','failure','fatigue'], 100),
+('d-load', 'brain-m1-phys-mech', 'brain-m1-phys', 'brain', 'Load', ARRAY['load','force','moment','torque','bending'], 95),
+('d-vibration', 'brain-m1-phys-mech', 'brain-m1-phys', 'brain', 'Vibration', ARRAY['vibration','frequency','resonance','damping'], 90),
+('d-pipe-flow', 'brain-m1-phys-fluid', 'brain-m1-phys', 'brain', 'Pipe Flow', ARRAY['pipe flow','pressure drop','friction','head loss'], 100),
+('d-viscosity', 'brain-m1-phys-fluid', 'brain-m1-phys', 'brain', 'Viscosity', ARRAY['viscosity','rheology','shear rate','non-newtonian'], 95),
+('d-turbulence', 'brain-m1-phys-fluid', 'brain-m1-phys', 'brain', 'Turbulence', ARRAY['turbulent','reynolds','eddy','mixing'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 4: FORMULAS
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m1-form', 'brain', 1, 'Formulas & Conversions', 'FORMULAS', ARRAY['formula','convert','unit','coefficient','factor','constant'], 85)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m1-form-eng', 'brain-m1-form', 'brain', 'Engineering', 'ENGINEERING', ARRAY['engineering','formula','calculate','design','sizing'], 100),
+('brain-m1-form-conv', 'brain-m1-form', 'brain', 'Conversions', 'CONVERSIONS', ARRAY['convert','unit','metric','imperial','si'], 95),
+('brain-m1-form-const', 'brain-m1-form', 'brain', 'Constants', 'CONSTANTS', ARRAY['constant','coefficient','factor','property','table'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-mech-form', 'brain-m1-form-eng', 'brain-m1-form', 'brain', 'Mechanical Formulas', ARRAY['mechanical','stress','deflection','beam'], 100),
+('d-fluid-form', 'brain-m1-form-eng', 'brain-m1-form', 'brain', 'Fluid Formulas', ARRAY['flow rate','pressure','head','velocity'], 95),
+('d-thermal-form', 'brain-m1-form-eng', 'brain-m1-form', 'brain', 'Thermal Formulas', ARRAY['heat','thermal','btuh','watt'], 90),
+('d-length-conv', 'brain-m1-form-conv', 'brain-m1-form', 'brain', 'Length', ARRAY['length','meter','foot','inch','mile'], 100),
+('d-mass-conv', 'brain-m1-form-conv', 'brain-m1-form', 'brain', 'Mass', ARRAY['mass','weight','kg','pound','ton'], 95),
+('d-pressure-conv', 'brain-m1-form-conv', 'brain-m1-form', 'brain', 'Pressure', ARRAY['pressure','psi','bar','pascal','gpm'], 90),
+('d-mat-props', 'brain-m1-form-const', 'brain-m1-form', 'brain', 'Material Props', ARRAY['modulus','density','hardness','tensile'], 100),
+('d-phys-const', 'brain-m1-form-const', 'brain-m1-form', 'brain', 'Physical Constants', ARRAY['gravity','pi','boltzmann','constant'], 95),
+('d-eng-coef', 'brain-m1-form-const', 'brain-m1-form', 'brain', 'Coefficients', ARRAY['coefficient','friction','drag','discharge'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 5: WEAR
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m1-wear', 'brain', 1, 'Wear & Corrosion', 'WEAR', ARRAY['wear','abrasion','erosion','corrosion','degradation','life','failure'], 80)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m1-wear-abr', 'brain-m1-wear', 'brain', 'Abrasion', 'ABRASION', ARRAY['abrasion','wear rate','particle','impact','sliding'], 100),
+('brain-m1-wear-corr', 'brain-m1-wear', 'brain', 'Corrosion', 'CORROSION', ARRAY['corrosion','chemical','oxidation','acid','degradation'], 95),
+('brain-m1-wear-eros', 'brain-m1-wear', 'brain', 'Erosion', 'EROSION', ARRAY['erosion','velocity','slurry erosion','cavitation'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-sliding-wear', 'brain-m1-wear-abr', 'brain-m1-wear', 'brain', 'Sliding Wear', ARRAY['sliding','friction','adhesive','two-body'], 100),
+('d-impact-wear', 'brain-m1-wear-abr', 'brain-m1-wear', 'brain', 'Impact Wear', ARRAY['impact','gouging','high-stress','particle impact'], 95),
+('d-wear-rate', 'brain-m1-wear-abr', 'brain-m1-wear', 'brain', 'Wear Rate', ARRAY['wear rate','volume loss','mass loss'], 90),
+('d-chem-corr', 'brain-m1-wear-corr', 'brain-m1-wear', 'brain', 'Chemical Corrosion', ARRAY['chemical','acid','alkali','solvent'], 100),
+('d-oxidation', 'brain-m1-wear-corr', 'brain-m1-wear', 'brain', 'Oxidation', ARRAY['oxidation','ozone','uv','weathering'], 95),
+('d-synergy', 'brain-m1-wear-corr', 'brain-m1-wear', 'brain', 'Synergy', ARRAY['synergy','corrosion-erosion','combined'], 90),
+('d-slurry-eros', 'brain-m1-wear-eros', 'brain-m1-wear', 'brain', 'Slurry Erosion', ARRAY['slurry erosion','particle','velocity'], 100),
+('d-cavitation', 'brain-m1-wear-eros', 'brain-m1-wear', 'brain', 'Cavitation', ARRAY['cavitation','bubble','collapse','pump'], 95),
+('d-life-pred', 'brain-m1-wear-eros', 'brain-m1-wear', 'brain', 'Life Prediction', ARRAY['life','prediction','remaining','failure'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 6: HYDRAULICS
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m1-hyd', 'brain', 1, 'Slurry & Hydraulics', 'HYDRAULICS', ARRAY['slurry','flow','pump','pipe','hydraulic','pressure','transport'], 75)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m1-hyd-slurry', 'brain-m1-hyd', 'brain', 'Slurry', 'SLURRY', ARRAY['slurry','solids','concentration','settling','critical velocity'], 100),
+('brain-m1-hyd-pump', 'brain-m1-hyd', 'brain', 'Pumps', 'PUMPS', ARRAY['pump','head','efficiency','cavitation','npsh','impeller'], 95),
+('brain-m1-hyd-pipe', 'brain-m1-hyd', 'brain', 'Piping', 'PIPING', ARRAY['pipe','pressure drop','friction','diameter','schedule'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-slurry-props', 'brain-m1-hyd-slurry', 'brain-m1-hyd', 'brain', 'Slurry Props', ARRAY['slurry','concentration','density','particle size'], 100),
+('d-settling', 'brain-m1-hyd-slurry', 'brain-m1-hyd', 'brain', 'Settling', ARRAY['settling','deposition','critical velocity'], 95),
+('d-hydrotrans', 'brain-m1-hyd-slurry', 'brain-m1-hyd', 'brain', 'Hydrotransport', ARRAY['hydrotransport','pipeline','transport'], 90),
+('d-pump-select', 'brain-m1-hyd-pump', 'brain-m1-hyd', 'brain', 'Pump Selection', ARRAY['pump selection','type','size','duty'], 100),
+('d-pump-curves', 'brain-m1-hyd-pump', 'brain-m1-hyd', 'brain', 'Pump Curves', ARRAY['curve','head','flow','efficiency','bep'], 95),
+('d-pump-wear', 'brain-m1-hyd-pump', 'brain-m1-hyd', 'brain', 'Pump Wear', ARRAY['impeller wear','liner','volute','slurry pump'], 90),
+('d-pipe-size', 'brain-m1-hyd-pipe', 'brain-m1-hyd', 'brain', 'Pipe Sizing', ARRAY['size','diameter','velocity','schedule'], 100),
+('d-press-loss', 'brain-m1-hyd-pipe', 'brain-m1-hyd', 'brain', 'Pressure Loss', ARRAY['pressure loss','friction','head loss','fittings'], 95),
+('d-pipe-wear', 'brain-m1-hyd-pipe', 'brain-m1-hyd', 'brain', 'Pipe Wear', ARRAY['pipe wear','lining','liner','elbow'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- MODEL 2: GPT-4o Mini (6 Nodes - Creative/Visual)
+-- ============================================================================
+
+-- Node 7: BLUEPRINTS
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m2-bp', 'brain', 2, 'Blueprints & Drawings', 'BLUEPRINTS', ARRAY['blueprint','drawing','schematic','diagram','layout','plan','sketch'], 100)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m2-bp-draw', 'brain-m2-bp', 'brain', 'Drawings', 'DRAWINGS', ARRAY['drawing','dimension','tolerance','view','section','detail'], 100),
+('brain-m2-bp-schem', 'brain-m2-bp', 'brain', 'Schematics', 'SCHEMATICS', ARRAY['schematic','symbol','circuit','flow diagram','pid'], 95),
+('brain-m2-bp-layout', 'brain-m2-bp', 'brain', 'Layouts', 'LAYOUTS', ARRAY['layout','arrangement','spacing','floor plan','site'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-mech-draw', 'brain-m2-bp-draw', 'brain-m2-bp', 'brain', 'Mechanical Drawings', ARRAY['mechanical','part','assembly','exploded'], 100),
+('d-dimensions', 'brain-m2-bp-draw', 'brain-m2-bp', 'brain', 'Dimensions', ARRAY['dimension','tolerance','gd&t','fit'], 95),
+('d-views', 'brain-m2-bp-draw', 'brain-m2-bp', 'brain', 'Views', ARRAY['view','section','projection','isometric'], 90),
+('d-elec-schem', 'brain-m2-bp-schem', 'brain-m2-bp', 'brain', 'Electrical', ARRAY['electrical','wiring','circuit','single line'], 100),
+('d-pid', 'brain-m2-bp-schem', 'brain-m2-bp', 'brain', 'P&ID', ARRAY['p&id','piping','instrumentation','process'], 95),
+('d-flow-diag', 'brain-m2-bp-schem', 'brain-m2-bp', 'brain', 'Flow Diagrams', ARRAY['flow diagram','block diagram','flowchart'], 90),
+('d-plant-layout', 'brain-m2-bp-layout', 'brain-m2-bp', 'brain', 'Plant Layout', ARRAY['plant','facility','equipment','arrangement'], 100),
+('d-pipe-route', 'brain-m2-bp-layout', 'brain-m2-bp', 'brain', 'Pipe Routing', ARRAY['pipe routing','isometric','spool'], 95),
+('d-struct-layout', 'brain-m2-bp-layout', 'brain-m2-bp', 'brain', 'Structural', ARRAY['structural','steel','foundation','framing'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 8: CAD
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m2-cad', 'brain', 2, 'CAD & 3D Modeling', 'CAD', ARRAY['cad','3d model','geometry','solidworks','autocad','design','modeling'], 95)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m2-cad-3d', 'brain-m2-cad', 'brain', '3D Modeling', '3D-MODEL', ARRAY['3d','model','solid','surface','mesh','assembly'], 100),
+('brain-m2-cad-sw', 'brain-m2-cad', 'brain', 'Software', 'CAD-SW', ARRAY['solidworks','autocad','fusion','inventor','catia'], 95),
+('brain-m2-cad-geom', 'brain-m2-cad', 'brain', 'Geometry', 'GEOMETRY', ARRAY['geometry','shape','feature','extrude','revolve'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-solid-model', 'brain-m2-cad-3d', 'brain-m2-cad', 'brain', 'Solid Modeling', ARRAY['solid','body','boolean','brep'], 100),
+('d-surface-model', 'brain-m2-cad-3d', 'brain-m2-cad', 'brain', 'Surface Modeling', ARRAY['surface','nurbs','patch','freeform'], 95),
+('d-assembly-model', 'brain-m2-cad-3d', 'brain-m2-cad', 'brain', 'Assembly', ARRAY['assembly','mate','constraint','component'], 90),
+('d-solidworks', 'brain-m2-cad-sw', 'brain-m2-cad', 'brain', 'SolidWorks', ARRAY['solidworks','sw','feature manager'], 100),
+('d-autocad', 'brain-m2-cad-sw', 'brain-m2-cad', 'brain', 'AutoCAD', ARRAY['autocad','dwg','2d','block'], 95),
+('d-fusion360', 'brain-m2-cad-sw', 'brain-m2-cad', 'brain', 'Fusion 360', ARRAY['fusion','cloud','parametric'], 90),
+('d-sketching', 'brain-m2-cad-geom', 'brain-m2-cad', 'brain', 'Sketching', ARRAY['sketch','constraint','2d profile'], 100),
+('d-features', 'brain-m2-cad-geom', 'brain-m2-cad', 'brain', 'Features', ARRAY['feature','extrude','revolve','sweep','loft'], 95),
+('d-parametric', 'brain-m2-cad-geom', 'brain-m2-cad', 'brain', 'Parametric', ARRAY['parametric','variable','equation','driven'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 9: 3D-PRINTING
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m2-3dp', 'brain', 2, '3D Printing', '3D-PRINTING', ARRAY['3d print','additive','prototype','stl','layer','filament'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m2-3dp-proc', 'brain-m2-3dp', 'brain', 'Processes', 'PROCESSES', ARRAY['fdm','sla','sls','dlp','resin','process'], 100),
+('brain-m2-3dp-mat', 'brain-m2-3dp', 'brain', 'Materials', 'MATERIALS', ARRAY['filament','resin','pla','abs','petg','nylon'], 95),
+('brain-m2-3dp-proto', 'brain-m2-3dp', 'brain', 'Prototyping', 'PROTOTYPING', ARRAY['prototype','rapid','iteration','functional'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-fdm', 'brain-m2-3dp-proc', 'brain-m2-3dp', 'brain', 'FDM', ARRAY['fdm','fff','extrusion','nozzle'], 100),
+('d-sla', 'brain-m2-3dp-proc', 'brain-m2-3dp', 'brain', 'SLA/DLP', ARRAY['sla','dlp','resin','uv'], 95),
+('d-sls', 'brain-m2-3dp-proc', 'brain-m2-3dp', 'brain', 'SLS', ARRAY['sls','sintering','powder','laser'], 90),
+('d-filaments', 'brain-m2-3dp-mat', 'brain-m2-3dp', 'brain', 'Filaments', ARRAY['pla','abs','petg','tpu','filament'], 100),
+('d-resins', 'brain-m2-3dp-mat', 'brain-m2-3dp', 'brain', 'Resins', ARRAY['resin','standard','tough','flexible'], 95),
+('d-print-settings', 'brain-m2-3dp-mat', 'brain-m2-3dp', 'brain', 'Settings', ARRAY['settings','temperature','speed','infill'], 90),
+('d-rapid-proto', 'brain-m2-3dp-proto', 'brain-m2-3dp', 'brain', 'Rapid Proto', ARRAY['rapid','quick','iteration','concept'], 100),
+('d-functional', 'brain-m2-3dp-proto', 'brain-m2-3dp', 'brain', 'Functional', ARRAY['functional','test','fit check','working'], 95),
+('d-dfam', 'brain-m2-3dp-proto', 'brain-m2-3dp', 'brain', 'Design for Print', ARRAY['dfam','orientation','overhang','support'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 10: IMAGES
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m2-img', 'brain', 2, 'Images & Visuals', 'IMAGES', ARRAY['image','photo','visual','picture','render','screenshot'], 85)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m2-img-ana', 'brain-m2-img', 'brain', 'Analysis', 'ANALYSIS', ARRAY['analyze','identify','detect','recognize','inspect'], 100),
+('brain-m2-img-rend', 'brain-m2-img', 'brain', 'Rendering', 'RENDERING', ARRAY['render','visualization','3d render','realistic'], 95),
+('brain-m2-img-doc', 'brain-m2-img', 'brain', 'Documentation', 'VIS-DOCS', ARRAY['photo','capture','record','evidence'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-visual-insp', 'brain-m2-img-ana', 'brain-m2-img', 'brain', 'Visual Inspection', ARRAY['inspect','defect','damage','condition'], 100),
+('d-img-measure', 'brain-m2-img-ana', 'brain-m2-img', 'brain', 'Measurement', ARRAY['measure','dimension','scale','calibrate'], 95),
+('d-img-compare', 'brain-m2-img-ana', 'brain-m2-img', 'brain', 'Comparison', ARRAY['compare','before after','difference'], 90),
+('d-3d-render', 'brain-m2-img-rend', 'brain-m2-img', 'brain', '3D Render', ARRAY['3d render','photorealistic','ray trace'], 100),
+('d-data-viz', 'brain-m2-img-rend', 'brain-m2-img', 'brain', 'Data Viz', ARRAY['visualize','chart','graph','plot'], 95),
+('d-animation', 'brain-m2-img-rend', 'brain-m2-img', 'brain', 'Animation', ARRAY['animate','motion','sequence','exploded'], 90),
+('d-photo-doc', 'brain-m2-img-doc', 'brain-m2-img', 'brain', 'Photo Doc', ARRAY['photo','document','record','site'], 100),
+('d-screenshot', 'brain-m2-img-doc', 'brain-m2-img', 'brain', 'Screenshots', ARRAY['screenshot','capture','screen'], 95),
+('d-markup', 'brain-m2-img-doc', 'brain-m2-img', 'brain', 'Markup', ARRAY['markup','annotate','label','callout'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 11: DOCUMENTATION
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m2-docs', 'brain', 2, 'Documentation', 'DOCUMENTATION', ARRAY['document','report','write','spec','technical','manual'], 80)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m2-docs-write', 'brain-m2-docs', 'brain', 'Writing', 'WRITING', ARRAY['write','report','document','describe','summarize'], 100),
+('brain-m2-docs-spec', 'brain-m2-docs', 'brain', 'Specs', 'SPECS', ARRAY['spec','requirement','standard','criteria'], 95),
+('brain-m2-docs-data', 'brain-m2-docs', 'brain', 'Datasheets', 'DATASHEETS', ARRAY['datasheet','manual','properties','tds'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-tech-reports', 'brain-m2-docs-write', 'brain-m2-docs', 'brain', 'Tech Reports', ARRAY['report','analysis','findings'], 100),
+('d-procedures', 'brain-m2-docs-write', 'brain-m2-docs', 'brain', 'Procedures', ARRAY['procedure','instruction','step','sop'], 95),
+('d-summaries', 'brain-m2-docs-write', 'brain-m2-docs', 'brain', 'Summaries', ARRAY['summary','abstract','overview'], 90),
+('d-prod-specs', 'brain-m2-docs-spec', 'brain-m2-docs', 'brain', 'Product Specs', ARRAY['product spec','requirements','features'], 100),
+('d-mat-specs', 'brain-m2-docs-spec', 'brain-m2-docs', 'brain', 'Material Specs', ARRAY['material spec','properties','grade'], 95),
+('d-design-specs', 'brain-m2-docs-spec', 'brain-m2-docs', 'brain', 'Design Specs', ARRAY['design spec','criteria','parameters'], 90),
+('d-tds', 'brain-m2-docs-data', 'brain-m2-docs', 'brain', 'TDS', ARRAY['tds','datasheet','technical data'], 100),
+('d-sds', 'brain-m2-docs-data', 'brain-m2-docs', 'brain', 'SDS', ARRAY['sds','msds','safety','hazard'], 95),
+('d-manuals', 'brain-m2-docs-data', 'brain-m2-docs', 'brain', 'Manuals', ARRAY['manual','guide','instructions'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 12: GENERAL
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m2-gen', 'brain', 2, 'General', 'GENERAL', ARRAY['help','question','explain','what','how','why','tell','assist'], 75)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m2-gen-qa', 'brain-m2-gen', 'brain', 'Q&A', 'QA', ARRAY['question','answer','what','why','how','when'], 100),
+('brain-m2-gen-exp', 'brain-m2-gen', 'brain', 'Explain', 'EXPLAIN', ARRAY['explain','describe','clarify','define'], 95),
+('brain-m2-gen-help', 'brain-m2-gen', 'brain', 'Help', 'HELP', ARRAY['help','assist','support','guide','recommend'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-what-is', 'brain-m2-gen-qa', 'brain-m2-gen', 'brain', 'What Is', ARRAY['what is','what are','definition'], 100),
+('d-how-to', 'brain-m2-gen-qa', 'brain-m2-gen', 'brain', 'How To', ARRAY['how to','how do','steps'], 95),
+('d-why', 'brain-m2-gen-qa', 'brain-m2-gen', 'brain', 'Why', ARRAY['why','reason','cause'], 90),
+('d-concepts', 'brain-m2-gen-exp', 'brain-m2-gen', 'brain', 'Concepts', ARRAY['concept','principle','theory'], 100),
+('d-processes', 'brain-m2-gen-exp', 'brain-m2-gen', 'brain', 'Processes', ARRAY['process','method','approach'], 95),
+('d-comparisons', 'brain-m2-gen-exp', 'brain-m2-gen', 'brain', 'Comparisons', ARRAY['compare','difference','vs'], 90),
+('d-recommend', 'brain-m2-gen-help', 'brain-m2-gen', 'brain', 'Recommend', ARRAY['recommend','suggest','advise'], 100),
+('d-troubleshoot', 'brain-m2-gen-help', 'brain-m2-gen', 'brain', 'Troubleshoot', ARRAY['troubleshoot','problem','solve'], 95),
+('d-guidance', 'brain-m2-gen-help', 'brain-m2-gen', 'brain', 'Guidance', ARRAY['guide','direction','advice'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- MODEL 3: Claude 3 Haiku (6 Nodes - Analysis/Precision)
+-- ============================================================================
+
+-- Node 13: MATERIALS
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m3-mat', 'brain', 3, 'Materials & Elastomers', 'MATERIALS', ARRAY['material','polyurethane','rubber','elastomer','properties','hardness'], 100)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m3-mat-elast', 'brain-m3-mat', 'brain', 'Elastomers', 'ELASTOMERS', ARRAY['rubber','urethane','neoprene','butyl','nitrile','epdm'], 100),
+('brain-m3-mat-props', 'brain-m3-mat', 'brain', 'Properties', 'PROPERTIES', ARRAY['hardness','tensile','elongation','modulus','tear'], 95),
+('brain-m3-mat-select', 'brain-m3-mat', 'brain', 'Selection', 'SELECTION', ARRAY['select','choose','compare','recommend'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-urethane-types', 'brain-m3-mat-elast', 'brain-m3-mat', 'brain', 'Urethane Types', ARRAY['urethane','ester','ether','mdi'], 100),
+('d-rubber-types', 'brain-m3-mat-elast', 'brain-m3-mat', 'brain', 'Rubber Types', ARRAY['natural rubber','sbr','chlorobutyl','mor'], 95),
+('d-specialty-elast', 'brain-m3-mat-elast', 'brain-m3-mat', 'brain', 'Specialty', ARRAY['neoprene','nitrile','viton','silicone'], 90),
+('d-mech-props', 'brain-m3-mat-props', 'brain-m3-mat', 'brain', 'Mechanical', ARRAY['tensile','elongation','modulus','tear'], 100),
+('d-hardness-props', 'brain-m3-mat-props', 'brain-m3-mat', 'brain', 'Hardness', ARRAY['hardness','shore','durometer'], 95),
+('d-chem-resist', 'brain-m3-mat-props', 'brain-m3-mat', 'brain', 'Resistance', ARRAY['resistance','chemical','oil','acid'], 90),
+('d-app-match', 'brain-m3-mat-select', 'brain-m3-mat', 'brain', 'App Matching', ARRAY['application','service','condition'], 100),
+('d-tradeoffs', 'brain-m3-mat-select', 'brain-m3-mat', 'brain', 'Trade-offs', ARRAY['trade-off','balance','pros cons'], 95),
+('d-cost-perf', 'brain-m3-mat-select', 'brain-m3-mat', 'brain', 'Cost vs Perf', ARRAY['cost','price','value','performance'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 14: MINING
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m3-mine', 'brain', 3, 'Mining & Oil Sands', 'MINING', ARRAY['mining','ore','tailings','oil sands','processing','extraction'], 95)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m3-mine-ops', 'brain-m3-mine', 'brain', 'Operations', 'OPERATIONS', ARRAY['mining','extraction','processing','ore','concentrate'], 100),
+('brain-m3-mine-oil', 'brain-m3-mine', 'brain', 'Oil Sands', 'OIL-SANDS', ARRAY['oil sands','bitumen','hydrotransport','froth'], 95),
+('brain-m3-mine-proc', 'brain-m3-mine', 'brain', 'Processing', 'PROCESSING', ARRAY['cyclone','screen','flotation','separation'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-ore-handling', 'brain-m3-mine-ops', 'brain-m3-mine', 'brain', 'Ore Handling', ARRAY['ore','handling','transport','conveyor'], 100),
+('d-tailings', 'brain-m3-mine-ops', 'brain-m3-mine', 'brain', 'Tailings', ARRAY['tailings','pond','disposal','thickener'], 95),
+('d-concentrate', 'brain-m3-mine-ops', 'brain-m3-mine', 'brain', 'Concentrate', ARRAY['concentrate','slurry','dewatering'], 90),
+('d-hydrotrans-os', 'brain-m3-mine-oil', 'brain-m3-mine', 'brain', 'Hydrotransport', ARRAY['hydrotransport','pipeline','oil sands'], 100),
+('d-extraction-os', 'brain-m3-mine-oil', 'brain-m3-mine', 'brain', 'Extraction', ARRAY['extraction','bitumen','froth'], 95),
+('d-oilsands-wear', 'brain-m3-mine-oil', 'brain-m3-mine', 'brain', 'OS Wear', ARRAY['wear','abrasion','lined pipe'], 90),
+('d-cyclones', 'brain-m3-mine-proc', 'brain-m3-mine', 'brain', 'Cyclones', ARRAY['hydrocyclone','classification'], 100),
+('d-screens', 'brain-m3-mine-proc', 'brain-m3-mine', 'brain', 'Screens', ARRAY['screen','panel','vibrating','mesh'], 95),
+('d-flotation', 'brain-m3-mine-proc', 'brain-m3-mine', 'brain', 'Flotation', ARRAY['flotation','cell','froth','reagent'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 15: MANUFACTURING
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m3-mfg', 'brain', 3, 'Manufacturing', 'MANUFACTURING', ARRAY['manufacture','production','casting','cure','fabrication'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m3-mfg-cast', 'brain-m3-mfg', 'brain', 'Casting', 'CASTING', ARRAY['cast','mold','pour','spin cast','centrifugal'], 100),
+('brain-m3-mfg-vulc', 'brain-m3-mfg', 'brain', 'Vulcanization', 'VULC', ARRAY['vulcanize','autoclave','cure','crosslink'], 95),
+('brain-m3-mfg-prod', 'brain-m3-mfg', 'brain', 'Production', 'PRODUCTION', ARRAY['production','batch','quality','capacity'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-ure-cast', 'brain-m3-mfg-cast', 'brain-m3-mfg', 'brain', 'Urethane Casting', ARRAY['urethane casting','pour','degass'], 100),
+('d-spin-cast', 'brain-m3-mfg-cast', 'brain-m3-mfg', 'brain', 'Spin Casting', ARRAY['spin cast','centrifugal','rotation'], 95),
+('d-mold-design', 'brain-m3-mfg-cast', 'brain-m3-mfg', 'brain', 'Mold Design', ARRAY['mold','tooling','mandrel'], 90),
+('d-autoclave', 'brain-m3-mfg-vulc', 'brain-m3-mfg', 'brain', 'Autoclave', ARRAY['autoclave','steam','pressure'], 100),
+('d-press-cure', 'brain-m3-mfg-vulc', 'brain-m3-mfg', 'brain', 'Press Curing', ARRAY['press','compression','heated'], 95),
+('d-cure-control', 'brain-m3-mfg-vulc', 'brain-m3-mfg', 'brain', 'Cure Control', ARRAY['cure time','temperature','control'], 90),
+('d-batch-ctrl', 'brain-m3-mfg-prod', 'brain-m3-mfg', 'brain', 'Batch Control', ARRAY['batch','lot','traceability'], 100),
+('d-capacity', 'brain-m3-mfg-prod', 'brain-m3-mfg', 'brain', 'Capacity', ARRAY['capacity','throughput','scheduling'], 95),
+('d-proc-ctrl', 'brain-m3-mfg-prod', 'brain-m3-mfg', 'brain', 'Process Control', ARRAY['process control','spc','parameter'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 16: QUALITY
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m3-qual', 'brain', 3, 'Quality & Testing', 'QUALITY', ARRAY['quality','test','inspection','qa','compliance','standard'], 85)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m3-qual-test', 'brain-m3-qual', 'brain', 'Testing', 'TESTING', ARRAY['test','measure','evaluate','method'], 100),
+('brain-m3-qual-insp', 'brain-m3-qual', 'brain', 'Inspection', 'INSPECTION', ARRAY['inspect','examine','verify','visual'], 95),
+('brain-m3-qual-std', 'brain-m3-qual', 'brain', 'Standards', 'STANDARDS', ARRAY['standard','compliance','iso','astm'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-phys-test', 'brain-m3-qual-test', 'brain-m3-qual', 'brain', 'Physical Test', ARRAY['tensile test','hardness test'], 100),
+('d-wear-test', 'brain-m3-qual-test', 'brain-m3-qual', 'brain', 'Wear Test', ARRAY['wear test','abrasion test','taber'], 95),
+('d-bond-test', 'brain-m3-qual-test', 'brain-m3-qual', 'brain', 'Bond Test', ARRAY['bond test','peel','adhesion'], 90),
+('d-vis-insp', 'brain-m3-qual-insp', 'brain-m3-qual', 'brain', 'Visual', ARRAY['visual','appearance','defect'], 100),
+('d-dim-insp', 'brain-m3-qual-insp', 'brain-m3-qual', 'brain', 'Dimensional', ARRAY['dimensional','measurement','tolerance'], 95),
+('d-ndt', 'brain-m3-qual-insp', 'brain-m3-qual', 'brain', 'NDT', ARRAY['ndt','ultrasonic','spark test'], 90),
+('d-iso', 'brain-m3-qual-std', 'brain-m3-qual', 'brain', 'ISO', ARRAY['iso','9001','quality management'], 100),
+('d-astm', 'brain-m3-qual-std', 'brain-m3-qual', 'brain', 'ASTM', ARRAY['astm','test method'], 95),
+('d-ind-std', 'brain-m3-qual-std', 'brain-m3-qual', 'brain', 'Industry', ARRAY['api','asme','industry','code'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 17: BONDING
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m3-bond', 'brain', 3, 'Bonding & Adhesives', 'BONDING', ARRAY['bond','adhesive','primer','surface','preparation'], 80)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m3-bond-adh', 'brain-m3-bond', 'brain', 'Adhesives', 'ADHESIVES', ARRAY['adhesive','glue','cement','epoxy'], 100),
+('brain-m3-bond-surf', 'brain-m3-bond', 'brain', 'Surface Prep', 'SURF-PREP', ARRAY['prep','clean','blast','prime'], 95),
+('brain-m3-bond-cure', 'brain-m3-bond', 'brain', 'Cure Systems', 'CURE-SYS', ARRAY['cure','set','pot life','open time'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-rubber-adh', 'brain-m3-bond-adh', 'brain-m3-bond', 'brain', 'Rubber Adhesive', ARRAY['rubber cement','contact','solvent'], 100),
+('d-ure-adh', 'brain-m3-bond-adh', 'brain-m3-bond', 'brain', 'Urethane Adhesive', ARRAY['urethane adhesive','pu adhesive'], 95),
+('d-primers', 'brain-m3-bond-adh', 'brain-m3-bond', 'brain', 'Primers', ARRAY['primer','tie coat','bonding agent'], 90),
+('d-blasting', 'brain-m3-bond-surf', 'brain-m3-bond', 'brain', 'Blasting', ARRAY['blast','grit','sandblast','profile'], 100),
+('d-cleaning', 'brain-m3-bond-surf', 'brain-m3-bond', 'brain', 'Cleaning', ARRAY['clean','degrease','solvent wipe'], 95),
+('d-profile', 'brain-m3-bond-surf', 'brain-m3-bond', 'brain', 'Profile', ARRAY['profile','roughness','anchor pattern'], 90),
+('d-cure-time', 'brain-m3-bond-cure', 'brain-m3-bond', 'brain', 'Cure Time', ARRAY['cure time','set time','full cure'], 100),
+('d-pot-life', 'brain-m3-bond-cure', 'brain-m3-bond', 'brain', 'Pot Life', ARRAY['pot life','working time','usable'], 95),
+('d-cure-cond', 'brain-m3-bond-cure', 'brain-m3-bond', 'brain', 'Conditions', ARRAY['temperature','humidity','environment'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- Node 18: PRODUCTS
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('brain-m3-prod', 'brain', 3, 'Products & Solutions', 'PRODUCTS', ARRAY['product','select','recommend','application','solution'], 75)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, label, keywords, priority) VALUES
+('brain-m3-prod-sel', 'brain-m3-prod', 'brain', 'Selection', 'SELECTION', ARRAY['select','choose','which','best'], 100),
+('brain-m3-prod-app', 'brain-m3-prod', 'brain', 'Applications', 'APPLICATIONS', ARRAY['application','use case','service'], 95),
+('brain-m3-prod-sol', 'brain-m3-prod', 'brain', 'Solutions', 'SOLUTIONS', ARRAY['solution','solve','address','improve'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+('d-lined-pipe', 'brain-m3-prod-sel', 'brain-m3-prod', 'brain', 'Lined Pipe', ARRAY['lined pipe','urethane lined','rubber lined'], 100),
+('d-wear-parts', 'brain-m3-prod-sel', 'brain-m3-prod', 'brain', 'Wear Parts', ARRAY['wear part','liner','component'], 95),
+('d-repair-kits', 'brain-m3-prod-sel', 'brain-m3-prod', 'brain', 'Repair Kits', ARRAY['repair kit','field repair','patch'], 90),
+('d-slurry-apps', 'brain-m3-prod-app', 'brain-m3-prod', 'brain', 'Slurry Apps', ARRAY['slurry','tailings','hydrotransport'], 100),
+('d-chem-apps', 'brain-m3-prod-app', 'brain-m3-prod', 'brain', 'Chemical Apps', ARRAY['chemical','corrosive','acid'], 95),
+('d-wear-apps', 'brain-m3-prod-app', 'brain-m3-prod', 'brain', 'Wear Apps', ARRAY['wear','abrasive','erosive'], 90),
+('d-upgrade', 'brain-m3-prod-sol', 'brain-m3-prod', 'brain', 'Upgrade', ARRAY['upgrade','improve','better','longer life'], 100),
+('d-prob-solve', 'brain-m3-prod-sol', 'brain-m3-prod', 'brain', 'Problem Solving', ARRAY['problem','issue','failure','solve'], 95),
+('d-optimize-sol', 'brain-m3-prod-sol', 'brain-m3-prod', 'brain', 'Optimization', ARRAY['optimize','efficiency','reduce cost'], 90)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- MODEL CONFIGURATION
+-- ============================================================================
+
+INSERT INTO ai_model_config (id, ai_type, model_slot, provider, model_name, is_primary, priority, max_tokens, temperature) VALUES
+('brain-m1-primary', 'brain', 1, 'openrouter', 'deepseek/deepseek-chat', TRUE, 100, 1000, 0.7),
+('brain-m1-backup1', 'brain', 1, 'openrouter', 'anthropic/claude-3.5-sonnet:beta', FALSE, 90, 1000, 0.7),
+('brain-m1-backup2', 'brain', 1, 'openrouter', 'google/gemini-2.0-flash-001:free', FALSE, 80, 1000, 0.7),
+('brain-m2-primary', 'brain', 2, 'github', 'gpt-4o-mini', TRUE, 100, 1000, 0.7),
+('brain-m2-backup1', 'brain', 2, 'openrouter', 'openai/gpt-4o-mini', FALSE, 90, 1000, 0.7),
+('brain-m2-backup2', 'brain', 2, 'openrouter', 'meta-llama/llama-3.3-70b-instruct:free', FALSE, 80, 1000, 0.7),
+('brain-m3-primary', 'brain', 3, 'openrouter', 'anthropic/claude-3-haiku:beta', TRUE, 100, 1000, 0.7),
+('brain-m3-backup1', 'brain', 3, 'openrouter', 'deepseek/deepseek-r1:free', FALSE, 90, 1000, 0.7),
+('brain-m3-backup2', 'brain', 3, 'openrouter', 'google/gemma-2-9b-it:free', FALSE, 80, 1000, 0.7),
+('heart-m1-primary', 'heart', 1, 'openrouter', 'deepseek/deepseek-chat', TRUE, 100, 1200, 0.3),
+('heart-m2-primary', 'heart', 2, 'openrouter', 'meta-llama/llama-3.3-70b-instruct:free', TRUE, 100, 1200, 0.3),
+('heart-m3-primary', 'heart', 3, 'openrouter', 'anthropic/claude-3-haiku:beta', TRUE, 100, 1200, 0.3),
+('system-m1-primary', 'system', 1, 'openrouter', 'deepseek/deepseek-r1:free', TRUE, 100, 800, 0.2),
+('system-m2-primary', 'system', 2, 'openrouter', 'anthropic/claude-3.5-sonnet:beta', TRUE, 100, 800, 0.2),
+('system-m3-primary', 'system', 3, 'github', 'gpt-4o-mini', TRUE, 100, 800, 0.2)
+ON CONFLICT (id) DO NOTHING;
+
+-- Heart/System placeholder nodes
+INSERT INTO ai_nodes (id, ai_type, model_slot, name, label, keywords, priority) VALUES
+('heart-code-repair', 'heart', NULL, 'Code Repair', 'CODE-REPAIR', ARRAY['fix','bug','error','repair'], 100),
+('heart-code-optimize', 'heart', NULL, 'Code Optimize', 'CODE-OPT', ARRAY['optimize','performance','refactor'], 95),
+('heart-ai-health', 'heart', NULL, 'AI Health', 'AI-HEALTH', ARRAY['ai','model','latency','health'], 90),
+('system-health', 'system', NULL, 'System Health', 'SYS-HEALTH', ARRAY['health','status','monitor','metrics'], 100),
+('system-auto-heal', 'system', NULL, 'Auto Heal', 'AUTO-HEAL', ARRAY['heal','recover','restore','fix'], 95),
+('system-memory', 'system', NULL, 'Memory', 'MEMORY', ARRAY['memory','cache','compress','cleanup'], 90)
+ON CONFLICT (id) DO NOTHING;

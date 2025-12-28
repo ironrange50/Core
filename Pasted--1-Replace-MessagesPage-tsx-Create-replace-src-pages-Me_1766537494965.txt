@@ -1,0 +1,1017 @@
+# 1. Replace `MessagesPage.tsx`
+
+Create/replace `src/pages/MessagesPage.tsx` with this:
+
+```tsx
+import React from 'react';
+import ProfileMessenger from '../components/ProfileMessenger';
+
+interface MessagesPageProps {
+  userId: string;
+  username: string;
+}
+
+export default function MessagesPage({ userId, username }: MessagesPageProps) {
+  return (
+    <div style={{ padding: 20, maxWidth: 1200, margin: '0 auto', minHeight: 'calc(100vh - 120px)' }}>
+      <h1
+        style={{
+          color: '#00d4ff',
+          marginBottom: 8,
+          fontSize: 24,
+          fontWeight: 600,
+        }}
+      >
+        Messages
+      </h1>
+      <p
+        style={{
+          color: '#888',
+          marginBottom: 16,
+          fontSize: 14,
+        }}
+      >
+        Chat with other online users about formulas, operations, and technical topics.
+      </p>
+      <ProfileMessenger userId={userId} username={username} />
+    </div>
+  );
+}
+```
+
+This just mounts the new messenger component. [1]
+
+***
+
+## 2. New `ProfileMessenger.tsx` (text chat, minimize/close)
+
+Create `src/components/ProfileMessenger.tsx` with this complete code:
+
+```tsx
+import React, { useEffect, useState, useCallback } from 'react';
+import io, { Socket } from 'socket.io-client';
+import { useApi } from '../hooks/useApi';
+
+interface MessengerUser {
+  id: string;
+  username: string;
+  status?: string;
+}
+
+interface MessengerMessage {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  content: string;
+  createdAt: string;
+}
+
+interface ConversationSummary {
+  conversationId: string;
+  otherUserId: string;
+  otherUsername: string;
+  lastMessage?: string;
+  lastTimestamp?: string;
+  unreadCount?: number;
+}
+
+interface ProfileMessengerProps {
+  userId: string;
+  username: string;
+}
+
+type MessengerMode = 'text' | 'video';
+
+let socket: Socket | null = null;
+
+const WEBSOCKET_URL =
+  (import.meta as any).env?.VITE_API_WS_URL || window.location.origin.replace(/^http/, 'ws');
+
+export default function ProfileMessenger({ userId, username }: ProfileMessengerProps) {
+  const { call } = useApi();
+
+  const [isOpen, setIsOpen] = useState(true);
+  const [isMinimized, setIsMinimized] = useState(false);
+  const [mode, setMode] = useState<MessengerMode>('text');
+
+  const [onlineUsers, setOnlineUsers] = useState<MessengerUser[]>([]);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<MessengerMessage[]>([]);
+  const [messageInput, setMessageInput] = useState('');
+
+  const [loadingUsers, setLoadingUsers] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [sending, setSending] = useState(false);
+
+  // --- WebSocket setup (for later video / presence) ---
+
+  useEffect(() => {
+    if (socket || !userId) return;
+
+    socket = io(WEBSOCKET_URL, {
+      transports: ['websocket', 'polling'],
+      withCredentials: false,
+    });
+
+    socket.on('connect', () => {
+      console.log('[Messenger] Socket connected', socket?.id);
+    });
+
+    socket.on('disconnect', () => {
+      console.log('[Messenger] Socket disconnected');
+    });
+
+    return () => {
+      socket?.disconnect();
+      socket = null;
+    };
+  }, [userId]);
+
+  // --- API helpers using existing /messaging routes ---
+
+  const fetchOnlineUsers = useCallback(async () => {
+    if (!userId) return;
+    setLoadingUsers(true);
+    const res = await call(`/api/messaging/online-users?userid=${encodeURIComponent(userId)}`, {
+      method: 'GET',
+    });
+    if (res.ok && res.data?.data) {
+      setOnlineUsers(res.data.data as MessengerUser[]);
+    }
+    setLoadingUsers(false);
+  }, [call, userId]);
+
+  const fetchConversations = useCallback(async () => {
+    if (!userId) return;
+    const res = await call(`/api/messaging/conversations?userid=${encodeURIComponent(userId)}`, {
+      method: 'GET',
+    });
+    if (res.ok && res.data?.data) {
+      setConversations(res.data.data as ConversationSummary[]);
+    }
+  }, [call, userId]);
+
+  const fetchMessages = useCallback(
+    async (conversationId: string) => {
+      setLoadingMessages(true);
+      const res = await call(`/api/messaging/conversation/${conversationId}`, {
+        method: 'GET',
+      });
+      if (res.ok && res.data?.data) {
+        setMessages(res.data.data as MessengerMessage[]);
+      } else {
+        setMessages([]);
+      }
+      setLoadingMessages(false);
+    },
+    [call],
+  );
+
+  const openConversationWithUser = useCallback(
+    async (otherUserId: string, otherUsername: string) => {
+      const res = await call('/api/messaging/conversation', {
+        method: 'POST',
+        body: JSON.stringify({ userid: userId, otherUserId }),
+      });
+
+      if (res.ok && res.data?.conversationId) {
+        const convId = res.data.conversationId as string;
+        setActiveConversationId(convId);
+        await fetchMessages(convId);
+
+        setConversations((prev) => {
+          const existing = prev.find((c) => c.conversationId === convId);
+          if (existing) return prev;
+          return [
+            {
+              conversationId: convId,
+              otherUserId,
+              otherUsername,
+              lastMessage: undefined,
+              lastTimestamp: undefined,
+              unreadCount: 0,
+            },
+            ...prev,
+          ];
+        });
+      }
+    },
+    [call, userId, fetchMessages],
+  );
+
+  const handleSendMessage = async () => {
+    if (!activeConversationId || !messageInput.trim()) return;
+    setSending(true);
+
+    const content = messageInput.trim();
+    setMessageInput('');
+
+    const res = await call('/api/messaging/send', {
+      method: 'POST',
+      body: JSON.stringify({
+        conversationId: activeConversationId,
+        content,
+        userid: userId,
+      }),
+    });
+
+    if (res.ok && res.data?.data) {
+      const msg = res.data.data as MessengerMessage;
+      setMessages((prev) => [...prev, msg]);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.conversationId === activeConversationId
+            ? {
+                ...c,
+                lastMessage: msg.content,
+                lastTimestamp: msg.createdAt,
+                unreadCount: 0,
+              }
+            : c,
+        ),
+      );
+    } else {
+      // naive local echo if send fails
+      const fallback: MessengerMessage = {
+        id: `local-${Date.now()}`,
+        conversationId: activeConversationId,
+        senderId: userId,
+        content: `Error sending: ${content}`,
+        createdAt: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, fallback]);
+    }
+
+    setSending(false);
+  };
+
+  // presence + conversations on mount
+  useEffect(() => {
+    if (!userId) return;
+    (async () => {
+      await call('/api/messaging/online', {
+        method: 'POST',
+        body: JSON.stringify({ userid: userId }),
+      });
+      await fetchOnlineUsers();
+      await fetchConversations();
+    })();
+
+    return () => {
+      if (!userId) return;
+      call('/api/messaging/offline', {
+        method: 'POST',
+        body: JSON.stringify({ userid: userId }),
+      });
+    };
+  }, [userId, call, fetchOnlineUsers, fetchConversations]);
+
+  // mark messages read when opening a conversation
+  useEffect(() => {
+    if (!activeConversationId || !userId) return;
+    (async () => {
+      await call('/api/messaging/mark-read', {
+        method: 'POST',
+        body: JSON.stringify({ conversationId: activeConversationId, userid: userId }),
+      });
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.conversationId === activeConversationId ? { ...c, unreadCount: 0 } : c,
+        ),
+      );
+    })();
+  }, [activeConversationId, userId, call]);
+
+  if (!isOpen) {
+    return (
+      <button
+        onClick={() => setIsOpen(true)}
+        style={{
+          padding: '10px 16px',
+          borderRadius: 9999,
+          border: '1px solid #4b5563',
+          background: '#020617',
+          color: '#e5e7eb',
+          cursor: 'pointer',
+        }}
+      >
+        Open Messenger
+      </button>
+    );
+  }
+
+  if (isMinimized && mode === 'text') {
+    return (
+      <div
+        style={{
+          position: 'fixed',
+          bottom: 16,
+          right: 16,
+          zIndex: 40,
+          background: '#020617',
+          color: '#e5e7eb',
+          padding: '8px 14px',
+          borderRadius: 9999,
+          border: '1px solid #4b5563',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+        }}
+      >
+        <span style={{ fontSize: 13 }}>Messages</span>
+        <button
+          onClick={() => setIsMinimized(false)}
+          style={{
+            padding: '4px 10px',
+            borderRadius: 9999,
+            border: 'none',
+            background: '#22c55e',
+            color: '#000',
+            fontSize: 12,
+            cursor: 'pointer',
+          }}
+        >
+          Restore
+        </button>
+        <button
+          onClick={() => {
+            setIsMinimized(false);
+            setIsOpen(false);
+          }}
+          style={{
+            padding: '4px 10px',
+            borderRadius: 9999,
+            border: 'none',
+            background: '#ef4444',
+            color: '#000',
+            fontSize: 12,
+            cursor: 'pointer',
+          }}
+        >
+          Close
+        </button>
+      </div>
+    );
+  }
+
+  const activeConversation = activeConversationId
+    ? conversations.find((c) => c.conversationId === activeConversationId) || null
+    : null;
+
+  return (
+    <div
+      className="chat-page"
+      style={{
+        maxWidth: '100%',
+        borderRadius: 16,
+        border: '1px solid #1f2933',
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          paddingBottom: 12,
+          marginBottom: 12,
+          borderBottom: '1px solid #1f2933',
+        }}
+      >
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 14, color: '#9ca3af' }}>Signed in as</div>
+          <div style={{ fontSize: 16, fontWeight: 600, color: '#e5e7eb' }}>{username}</div>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            onClick={() => {
+              if (mode === 'text') {
+                setIsMinimized(true);
+              }
+            }}
+            style={{
+              padding: '6px 10px',
+              borderRadius: 9999,
+              border: '1px solid #4b5563',
+              background: 'transparent',
+              color: '#e5e7eb',
+              fontSize: 12,
+              cursor: 'pointer',
+            }}
+          >
+            Minimize
+          </button>
+          <button
+            onClick={() => setIsOpen(false)}
+            style={{
+              padding: '6px 10px',
+              borderRadius: 9999,
+              border: '1px solid #4b5563',
+              background: 'transparent',
+              color: '#e5e7eb',
+              fontSize: 12,
+              cursor: 'pointer',
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '260px 1fr',
+          gap: 16,
+          minHeight: 420,
+        }}
+      >
+        {/* LEFT: conversations + online users */}
+        <div
+          style={{
+            borderRight: '1px solid #1f2933',
+            paddingRight: 12,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 12,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: '#e5e7eb' }}>Conversations</span>
+            <button
+              onClick={fetchConversations}
+              style={{
+                border: 'none',
+                background: 'transparent',
+                color: '#9ca3af',
+                fontSize: 11,
+                cursor: 'pointer',
+              }}
+            >
+              Refresh
+            </button>
+          </div>
+          <div
+            style={{
+              maxHeight: 220,
+              overflowY: 'auto',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 6,
+            }}
+          >
+            {conversations.length === 0 && (
+              <div style={{ fontSize: 12, color: '#6b7280' }}>No conversations yet.</div>
+            )}
+            {conversations.map((c) => (
+              <button
+                key={c.conversationId}
+                onClick={() => setActiveConversationId(c.conversationId)}
+                style={{
+                  textAlign: 'left',
+                  padding: '8px 10px',
+                  borderRadius: 12,
+                  border:
+                    c.conversationId === activeConversationId
+                      ? '1px solid #fbbf24'
+                      : '1px solid transparent',
+                  background:
+                    c.conversationId === activeConversationId ? '#111827' : 'transparent',
+                  color: '#e5e7eb',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 2,
+                  fontSize: 13,
+                }}
+              >
+                <span style={{ fontWeight: 600 }}>{c.otherUsername}</span>
+                {c.lastMessage && (
+                  <span
+                    style={{
+                      fontSize: 12,
+                      color: '#9ca3af',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {c.lastMessage}
+                  </span>
+                )}
+                {c.unreadCount && c.unreadCount > 0 && (
+                  <span
+                    style={{
+                      marginTop: 4,
+                      alignSelf: 'flex-start',
+                      padding: '2px 6px',
+                      borderRadius: 9999,
+                      background: '#f97316',
+                      color: '#000',
+                      fontSize: 11,
+                    }}
+                  >
+                    {c.unreadCount} new
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          <div
+            style={{
+              marginTop: 12,
+              paddingTop: 12,
+              borderTop: '1px solid #1f2933',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+              }}
+            >
+              <span style={{ fontSize: 13, fontWeight: 600, color: '#e5e7eb' }}>
+                Online users
+              </span>
+              <button
+                onClick={fetchOnlineUsers}
+                style={{
+                  border: 'none',
+                  background: 'transparent',
+                  color: '#9ca3af',
+                  fontSize: 11,
+                  cursor: 'pointer',
+                }}
+              >
+                {loadingUsers ? '...' : 'Refresh'}
+              </button>
+            </div>
+            <div
+              style={{
+                maxHeight: 180,
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 4,
+              }}
+            >
+              {onlineUsers.length === 0 && (
+                <div style={{ fontSize: 12, color: '#6b7280' }}>No one online.</div>
+              )}
+              {onlineUsers
+                .filter((u) => u.id !== userId)
+                .map((u) => (
+                  <button
+                    key={u.id}
+                    onClick={() => openConversationWithUser(u.id, u.username)}
+                    style={{
+                      textAlign: 'left',
+                      padding: '6px 8px',
+                      borderRadius: 9999,
+                      border: '1px solid transparent',
+                      background: 'transparent',
+                      color: '#e5e7eb',
+                      cursor: 'pointer',
+                      fontSize: 13,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        background: '#22c55e',
+                      }}
+                    />
+                    <span>{u.username}</span>
+                  </button>
+                ))}
+            </div>
+          </div>
+        </div>
+
+        {/* RIGHT: active chat thread */}
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+          }}
+        >
+          <div
+            style={{
+              paddingBottom: 8,
+              borderBottom: '1px solid #1f2933',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 13, color: '#9ca3af' }}>Chatting with</div>
+              <div style={{ fontSize: 16, fontWeight: 600, color: '#e5e7eb' }}>
+                {activeConversation?.otherUsername || 'No conversation selected'}
+              </div>
+            </div>
+            <button
+              disabled={!activeConversation}
+              style={{
+                padding: '6px 12px',
+                borderRadius: 9999,
+                border: '1px solid #4b5563',
+                background: 'transparent',
+                color: activeConversation ? '#e5e7eb' : '#4b5563',
+                fontSize: 12,
+                cursor: activeConversation ? 'pointer' : 'default',
+              }}
+              onClick={() => {
+                // placeholder – video behavior will be added in later chunk
+                if (!activeConversation) return;
+                setMode('video');
+                alert('Video call placeholder – video wiring will be added next.');
+              }}
+            >
+              Start video
+            </button>
+          </div>
+
+          <div
+            className="messages-area"
+            style={{
+              minHeight: 260,
+            }}
+          >
+            {loadingMessages ? (
+              <div style={{ fontSize: 13, color: '#9ca3af' }}>Loading messages...</div>
+            ) : !activeConversationId ? (
+              <div className="empty-state">
+                <p className="greeting-text">Select a user to start chatting.</p>
+              </div>
+            ) : messages.length === 0 ? (
+              <div style={{ fontSize: 13, color: '#9ca3af' }}>No messages yet.</div>
+            ) : (
+              messages.map((m) => {
+                const isMe = m.senderId === userId;
+                return (
+                  <div
+                    key={m.id}
+                    style={{
+                      display: 'flex',
+                      justifyContent: isMe ? 'flex-end' : 'flex-start',
+                    }}
+                  >
+                    <div
+                      style={{
+                        maxWidth: '70%',
+                        padding: '8px 12px',
+                        borderRadius: 16,
+                        background: isMe ? '#22c55e' : '#111827',
+                        color: isMe ? '#000' : '#e5e7eb',
+                        fontSize: 13,
+                        whiteSpace: 'pre-wrap',
+                        wordWrap: 'break-word',
+                      }}
+                    >
+                      {m.content}
+                      <div
+                        style={{
+                          marginTop: 4,
+                          fontSize: 10,
+                          opacity: 0.7,
+                          textAlign: isMe ? 'right' : 'left',
+                        }}
+                      >
+                        {new Date(m.createdAt).toLocaleTimeString()}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          <div className="chat-input-area">
+            <input
+              type="text"
+              placeholder={
+                activeConversationId ? 'Type a message...' : 'Select a user or conversation first'
+              }
+              value={messageInput}
+              onChange={(e) => setMessageInput(e.target.value)}
+              disabled={!activeConversationId || sending}
+            />
+            <button
+              onClick={handleSendMessage}
+              disabled={!activeConversationId || sending || !messageInput.trim()}
+            >
+              {sending ? 'Sending...' : 'Send'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+This uses your existing `/api/messaging/*` routes and `useApi` hook. [2][3]
+
+***
+
+## 3. Small CSS tweak (optional but recommended)
+
+`ChatPage.css` already defines `.chat-page`, `.messages-area`, and `.chat-input-area`, so the component will inherit those styles. [4] 
+
+If the left/right layout feels too tight, you can later add a small `.messenger-page` rule, but nothing is required right now.
+
+***
+
+## 4. Replit integration steps
+
+1. In Replit file tree:
+   - Replace `src/pages/MessagesPage.tsx` with the code from section 1. 
+   - Create `src/components/ProfileMessenger.tsx` and paste section 2. [1]
+
+2. Ensure imports:
+   - `useApi` is already defined in `src/hooks/useApi.ts` (same as used by `ChatPage`). [5]
+   - `socket.io-client` is already in `package.json` from your other real‑time features; if not, add it in Replit shell: 
+     `npm install socket.io-client`.
+
+3. Restart dev server:
+   - Stop and re‑run `npm run dev` (or the Replit “Run” button) so Vite picks up new files and TS types.
+
+4. Test:
+   - Log in as one user, open “Messages” page. 
+   - Log in as another user in a second browser/incognito, go to “Messages”. 
+   - Use the “Online users” list to start a conversation and send messages both directions. 
+
+********************************
+
+perfect. now continue
+
+Next is **file sharing + prep for video** on top of what you pasted.
+
+## 1. Reuse your upload pipeline in chat
+
+You already have `useFileUpload` and `/api/file-upload` wired to Postgres (`fileUploads`, `ingestedFiles`). [1][2]
+The messenger will just call that hook, then send a normal message containing a reference (URL or id) to the uploaded file; no JSON‑file storage is added. [3][2]
+
+***
+
+## 2. Update `ProfileMessenger.tsx` to add attachments
+
+Open `src/components/ProfileMessenger.tsx` and:
+
+### 2.1 Add imports and types at the top
+
+Just below your existing imports, extend them like this:
+
+```tsx
+import React, { useEffect, useState, useCallback } from 'react';
+import io, { Socket } from 'socket.io-client';
+import { useApi } from '../hooks/useApi';
+import { useFileUpload } from '../hooks/useFileUpload'; // NEW
+import type { UploadResponse } from '../types';          // already defined [file:260]
+```
+
+Add an attachment shape:
+
+```tsx
+interface AttachmentInfo {
+  id: string;
+  originalName: string;
+  storedPath: string;
+  mimeType: string;
+  size: number;
+}
+```
+
+Extend `MessengerMessage` so chat bubbles know if a message has an attachment:
+
+```tsx
+interface MessengerMessage {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  content: string;
+  createdAt: string;
+  attachment?: AttachmentInfo; // NEW
+}
+```
+
+### 2.2 Initialize the upload hook
+
+Inside `ProfileMessenger` (after `const { call } = useApi();`), add:
+
+```tsx
+const { uploadFile, getUploadStatus } = useFileUpload(); // NEW
+const [uploadingAttachment, setUploadingAttachment] = useState(false);
+```
+
+`useFileUpload` already POSTs to `/api/file-upload` and records status, using Postgres for the records. [2]
+
+***
+
+### 2.3 Add an “Attach” handler
+
+Still inside the component, add this function:
+
+```tsx
+const handleAttachFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+  if (!activeConversationId) return;
+  const file = event.target.files?.[0];
+  if (!file) return;
+
+  setUploadingAttachment(true);
+  try {
+    const result = await uploadFile(file);
+    if (!result.success || !result.fileId) {
+      alert(result.error || 'File upload failed');
+      return;
+    }
+
+    // Send a message that references the uploaded file
+    const res = await call('/api/messaging/send', {
+      method: 'POST',
+      body: JSON.stringify({
+        conversationId: activeConversationId,
+        content: `File: ${file.name}`,
+        userid: userId,
+        attachmentId: result.fileId, // server can resolve to fileUploads row
+      }),
+    });
+
+    if (res.ok && res.data?.data) {
+      const msg = res.data.data as MessengerMessage;
+      setMessages((prev) => [...prev, msg]);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.conversationId === activeConversationId
+            ? {
+                ...c,
+                lastMessage: msg.content,
+                lastTimestamp: msg.createdAt,
+                unreadCount: 0,
+              }
+            : c,
+        ),
+      );
+    }
+  } finally {
+    setUploadingAttachment(false);
+    event.target.value = '';
+  }
+};
+```
+
+This reuses the existing upload flow and keeps file metadata in Postgres (`fileUploads` + `ingestedFiles`). [1][2]
+
+***
+
+### 2.4 Show attachments in the input area
+
+Find the bottom `chat-input-area` JSX:
+
+```tsx
+<div className="chat-input-area">
+  <input ... />
+  <button ...>...</button>
+</div>
+```
+
+Replace it with:
+
+```tsx
+<div className="chat-input-area">
+  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+    <label
+      style={{
+        width: 36,
+        height: 36,
+        borderRadius: '50%',
+        border: '1px solid #d1d5db',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        cursor: activeConversationId && !uploadingAttachment ? 'pointer' : 'default',
+        opacity: activeConversationId ? 1 : 0.4,
+        background: 'var(--card-bg, white)',
+      }}
+    >
+      📎
+      <input
+        type="file"
+        style={{ display: 'none' }}
+        disabled={!activeConversationId || uploadingAttachment}
+        onChange={handleAttachFile}
+      />
+    </label>
+    <input
+      type="text"
+      placeholder={
+        activeConversationId ? 'Type a message...' : 'Select a user or conversation first'
+      }
+      value={messageInput}
+      onChange={(e) => setMessageInput(e.target.value)}
+      disabled={!activeConversationId || sending}
+    />
+  </div>
+  <button
+    onClick={handleSendMessage}
+    disabled={!activeConversationId || sending || !messageInput.trim()}
+  >
+    {sending ? 'Sending...' : 'Send'}
+  </button>
+</div>
+```
+
+This gives you the standard paperclip + text box + send button, like common SMS/RCS messengers. [4][5]
+
+***
+
+### 2.5 Render attachment bubbles in the thread
+
+In the messages map:
+
+```tsx
+messages.map((m) => {
+  const isMe = m.senderId === userId;
+  return (
+    <div key={m.id} ...>
+      <div ...>
+        {m.content}
+        <div ...>{time}</div>
+      </div>
+    </div>
+  );
+});
+```
+
+Replace the inner bubble with:
+
+```tsx
+<div
+  style={{
+    maxWidth: '70%',
+    padding: '8px 12px',
+    borderRadius: 16,
+    background: isMe ? '#22c55e' : '#111827',
+    color: isMe ? '#000' : '#e5e7eb',
+    fontSize: 13,
+    whiteSpace: 'pre-wrap',
+    wordWrap: 'break-word',
+  }}
+>
+  {m.attachment ? (
+    <div style={{ marginBottom: 4 }}>
+      <div style={{ fontWeight: 600, marginBottom: 2 }}>Attachment</div>
+      <a
+        href={m.attachment.storedPath}
+        target="_blank"
+        rel="noreferrer"
+        style={{ color: isMe ? '#000' : '#38bdf8', textDecoration: 'underline', fontSize: 12 }}
+      >
+        {m.attachment.originalName}
+      </a>
+      <div style={{ fontSize: 10, opacity: 0.7 }}>
+        {(m.attachment.size / 1024).toFixed(1)} KB
+      </div>
+    </div>
+  ) : null}
+  <div>{m.content}</div>
+  <div
+    style={{
+      marginTop: 4,
+      fontSize: 10,
+      opacity: 0.7,
+      textAlign: isMe ? 'right' : 'left',
+    }}
+  >
+    {new Date(m.createdAt).toLocaleTimeString()}
+  </div>
+</div>
+```
+
+This expects your `/api/messaging/send` to include `attachment` in the response when `attachmentId` is provided; the server can join `fileUploads` and embed that JSON as part of the message row, still stored in Postgres. [1][3]
+
+***
+
+## 3. Minimal backend expectation
+
+For the above to work cleanly, adjust your server‑side `sendMessage` implementation so that when `attachmentId` is present:
+
+- It stores `attachmentId` (foreign key to `fileUploads`) in the `messages` table. [1]
+- It populates an `attachment` object in the JSON response with `originalFilename`, `storedFilename/filePath`, `mimeType`, and `fileSize`. [1][2]
+
+No JSON files are introduced; only structured Postgres rows with a small JSON field in the API response, which matches your hybrid design. [1][6][7]
+
+***
+
+## 4. Next (after you confirm this builds)

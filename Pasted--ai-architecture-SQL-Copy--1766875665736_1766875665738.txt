@@ -1,0 +1,324 @@
+ ai architecture · SQL
+Copy
+
+-- ============================================================================
+-- NEUROCORE V2: TRIPLE AI ARCHITECTURE
+-- Brain AI (Iracore) | Heart AI (Code/AI) | System AI (Health)
+-- ============================================================================
+
+-- AI Nodes table
+CREATE TABLE IF NOT EXISTS ai_nodes (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'heart', 'system')),
+  name VARCHAR(128) NOT NULL,
+  description TEXT,
+  keywords TEXT[] NOT NULL DEFAULT '{}',
+  priority INTEGER NOT NULL DEFAULT 50,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- AI Stacks table
+CREATE TABLE IF NOT EXISTS ai_stacks (
+  id VARCHAR(64) PRIMARY KEY,
+  node_id VARCHAR(64) NOT NULL REFERENCES ai_nodes(id) ON DELETE CASCADE,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'heart', 'system')),
+  name VARCHAR(128) NOT NULL,
+  description TEXT,
+  keywords TEXT[] NOT NULL DEFAULT '{}',
+  priority INTEGER NOT NULL DEFAULT 50,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- AI Domains table
+CREATE TABLE IF NOT EXISTS ai_domains (
+  id VARCHAR(64) PRIMARY KEY,
+  stack_id VARCHAR(64) NOT NULL REFERENCES ai_stacks(id) ON DELETE CASCADE,
+  node_id VARCHAR(64) NOT NULL REFERENCES ai_nodes(id) ON DELETE CASCADE,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'heart', 'system')),
+  name VARCHAR(128) NOT NULL,
+  description TEXT,
+  keywords TEXT[] NOT NULL DEFAULT '{}',
+  system_prompt TEXT,
+  priority INTEGER NOT NULL DEFAULT 50,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- AI Memories table (Brain has own, Heart+System share)
+CREATE TABLE IF NOT EXISTS ai_memories (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'shared')),
+  domain_id VARCHAR(64) REFERENCES ai_domains(id) ON DELETE SET NULL,
+  content TEXT NOT NULL,
+  context JSONB DEFAULT '{}',
+  relevance_score REAL DEFAULT 0.5,
+  usage_count INTEGER DEFAULT 0,
+  last_used_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Knowledge Tree (Brain has own, Heart+System share)
+CREATE TABLE IF NOT EXISTS knowledge_tree (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'shared')),
+  parent_id VARCHAR(64) REFERENCES knowledge_tree(id) ON DELETE CASCADE,
+  node_type VARCHAR(32) NOT NULL CHECK (node_type IN ('root', 'branch', 'leaf')),
+  name VARCHAR(256) NOT NULL,
+  content TEXT,
+  metadata JSONB DEFAULT '{}',
+  depth INTEGER NOT NULL DEFAULT 0,
+  path TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- AI Model Configuration
+CREATE TABLE IF NOT EXISTS ai_model_config (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL CHECK (ai_type IN ('brain', 'heart', 'system')),
+  model_slot INTEGER NOT NULL CHECK (model_slot IN (1, 2, 3)),
+  provider VARCHAR(64) NOT NULL,
+  model_name VARCHAR(128) NOT NULL,
+  is_primary BOOLEAN DEFAULT FALSE,
+  is_backup BOOLEAN DEFAULT FALSE,
+  priority INTEGER NOT NULL DEFAULT 50,
+  max_tokens INTEGER DEFAULT 1000,
+  temperature REAL DEFAULT 0.7,
+  timeout_ms INTEGER DEFAULT 30000,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(ai_type, model_slot, provider, model_name)
+);
+
+-- AI Routing Log (for learning)
+CREATE TABLE IF NOT EXISTS ai_routing_log (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL,
+  model_slot INTEGER NOT NULL,
+  prompt_hash VARCHAR(256),
+  selected_node_id VARCHAR(64),
+  selected_stack_id VARCHAR(64),
+  selected_domain_id VARCHAR(64),
+  memories_used INTEGER DEFAULT 0,
+  routing_time_ms INTEGER,
+  confidence REAL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- AI Response Log
+CREATE TABLE IF NOT EXISTS ai_response_log (
+  id VARCHAR(64) PRIMARY KEY,
+  ai_type VARCHAR(32) NOT NULL,
+  prompt_preview TEXT,
+  model1_response TEXT,
+  model1_time_ms INTEGER,
+  model2_response TEXT,
+  model2_time_ms INTEGER,
+  model3_response TEXT,
+  model3_time_ms INTEGER,
+  knowledge_algorithm_result TEXT,
+  final_answer TEXT,
+  total_time_ms INTEGER,
+  quality_score REAL,
+  user_feedback VARCHAR(32),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Create indexes
+CREATE INDEX IF NOT EXISTS idx_ai_nodes_type ON ai_nodes(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_nodes_keywords ON ai_nodes USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_ai_stacks_node ON ai_stacks(node_id);
+CREATE INDEX IF NOT EXISTS idx_ai_stacks_type ON ai_stacks(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_stacks_keywords ON ai_stacks USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_ai_domains_stack ON ai_domains(stack_id);
+CREATE INDEX IF NOT EXISTS idx_ai_domains_node ON ai_domains(node_id);
+CREATE INDEX IF NOT EXISTS idx_ai_domains_type ON ai_domains(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_domains_keywords ON ai_domains USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_ai_memories_type ON ai_memories(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_memories_domain ON ai_memories(domain_id);
+CREATE INDEX IF NOT EXISTS idx_ai_memories_relevance ON ai_memories(relevance_score DESC);
+CREATE INDEX IF NOT EXISTS idx_knowledge_tree_type ON knowledge_tree(ai_type);
+CREATE INDEX IF NOT EXISTS idx_knowledge_tree_parent ON knowledge_tree(parent_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_tree_path ON knowledge_tree(path);
+CREATE INDEX IF NOT EXISTS idx_ai_model_config_type ON ai_model_config(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_routing_log_type ON ai_routing_log(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_routing_log_created ON ai_routing_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_response_log_type ON ai_response_log(ai_type);
+CREATE INDEX IF NOT EXISTS idx_ai_response_log_created ON ai_response_log(created_at DESC);
+
+-- ============================================================================
+-- SEED DATA: Brain AI Nodes (Iracore - Standalone) - 8 Nodes
+-- ============================================================================
+
+INSERT INTO ai_nodes (id, ai_type, name, description, keywords, priority) VALUES
+  ('brain-general', 'brain', 'General Assistant', 'General user assistance and conversation', ARRAY['help', 'question', 'explain', 'what', 'how', 'why', 'tell', 'describe'], 100),
+  ('brain-mechanical', 'brain', 'Mechanical & Structures', 'Mechanical, structural, materials, manufacturing', ARRAY['mechanical', 'structural', 'materials', 'manufacturing', 'stress', 'loa
+
+-- ============================================================================
+-- SEED DATA: Heart AI Nodes (Code/AI Health - Shared with System)
+-- ============================================================================
+
+INSERT INTO ai_nodes (id, ai_type, name, description, keywords, priority) VALUES
+  ('heart-code-repair', 'heart', 'Code Repair', 'Fix bugs, errors, and code issues', ARRAY['fix', 'bug', 'error', 'repair', 'debug', 'broken', 'crash', 'exception'], 100),
+  ('heart-code-optimize', 'heart', 'Code Optimization', 'Optimize and improve code performance', ARRAY['optimize', 'improve', 'performance', 'refactor', 'clean', 'speed', 'efficient'], 95),
+  ('heart-ai-health', 'heart', 'AI Health', 'Monitor AI model health and performance', ARRAY['ai', 'model', 'health', 'latency', 'accuracy', 'tokens', 'provider'], 90),
+  ('heart-self-mod', 'heart', 'Self Modification', 'Propose and implement code modifications', ARRAY['modify', 'update', 'change', 'patch', 'upgrade', 'enhance', 'implement'], 85),
+  ('heart-security', 'heart', 'Security', 'Security scanning and vulnerability detection', ARRAY['security', 'vulnerability', 'audit', 'scan', 'threat', 'risk', 'protect'], 80)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- SEED DATA: System AI Nodes (System Health - Shared with Heart)
+-- ============================================================================
+
+INSERT INTO ai_nodes (id, ai_type, name, description, keywords, priority) VALUES
+  ('system-health', 'system', 'System Health', 'Monitor overall system health and metrics', ARRAY['health', 'status', 'monitor', 'metrics', 'performance', 'cpu', 'memory', 'disk'], 100),
+  ('system-auto-heal', 'system', 'Auto Healing', 'Automatic system healing and recovery', ARRAY['heal', 'recover', 'restore', 'auto', 'self-repair', 'fix', 'restart'], 95),
+  ('system-memory-mgmt', 'system', 'Memory Management', 'Manage memory, compression, cleanup', ARRAY['memory', 'cache', 'compress', 'cleanup', 'storage', 'purge', 'archive'], 90),
+  ('system-scheduler', 'system', 'Scheduler', 'Schedule and manage background tasks', ARRAY['schedule', 'task', 'job', 'cron', 'queue', 'background', 'timer'], 85),
+  ('system-diagnostics', 'system', 'Diagnostics', 'Run system diagnostics and analysis', ARRAY['diagnose', 'diagnostic', 'analyze', 'check', 'test', 'verify', 'inspect'], 80)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- SEED DATA: Brain AI Stacks
+-- ============================================================================
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, keywords, priority) VALUES
+  ('brain-general-conversation', 'brain-general', 'brain', 'Conversation', ARRAY['chat', 'talk', 'conversation', 'discuss'], 100),
+  ('brain-general-qa', 'brain-general', 'brain', 'Q&A', ARRAY['question', 'answer', 'ask', 'tell'], 95),
+  ('brain-eng-mechanical', 'brain-engineering', 'brain', 'Mechanical', ARRAY['mechanical', 'stress', 'load', 'gear', 'shaft'], 100),
+  ('brain-eng-electrical', 'brain-engineering', 'brain', 'Electrical', ARRAY['electrical', 'circuit', 'voltage', 'current', 'power'], 95),
+  ('brain-eng-structural', 'brain-engineering', 'brain', 'Structural', ARRAY['structural', 'beam', 'column', 'foundation', 'building'], 90),
+  ('brain-eng-thermal', 'brain-engineering', 'brain', 'Thermal', ARRAY['thermal', 'heat', 'temperature', 'cooling', 'hvac'], 85),
+  ('brain-eng-process', 'brain-engineering', 'brain', 'Process', ARRAY['process', 'slurry', 'flow', 'pipe', 'pump', 'mining'], 80),
+  ('brain-creative-writing', 'brain-creative', 'brain', 'Writing', ARRAY['write', 'document', 'report', 'article'], 100),
+  ('brain-creative-blueprint', 'brain-creative', 'brain', 'Blueprint', ARRAY['blueprint', 'design', 'spec', 'plan'], 95)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- SEED DATA: Heart AI Stacks (Shared)
+-- ============================================================================
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, keywords, priority) VALUES
+  ('heart-repair-typescript', 'heart-code-repair', 'heart', 'TypeScript', ARRAY['typescript', 'ts', 'type', 'interface', 'generic'], 100),
+  ('heart-repair-react', 'heart-code-repair', 'heart', 'React', ARRAY['react', 'component', 'hook', 'jsx', 'tsx', 'useState'], 95),
+  ('heart-repair-node', 'heart-code-repair', 'heart', 'Node.js', ARRAY['node', 'express', 'server', 'backend', 'api'], 90),
+  ('heart-repair-database', 'heart-code-repair', 'heart', 'Database', ARRAY['database', 'sql', 'postgres', 'query', 'drizzle'], 85),
+  ('heart-optimize-perf', 'heart-code-optimize', 'heart', 'Performance', ARRAY['performance', 'speed', 'optimize', 'slow', 'fast'], 100),
+  ('heart-optimize-memory', 'heart-code-optimize', 'heart', 'Memory', ARRAY['memory', 'leak', 'garbage', 'heap'], 95),
+  ('heart-ai-monitor', 'heart-ai-health', 'heart', 'AI Monitor', ARRAY['monitor', 'model', 'latency', 'tokens'], 100),
+  ('heart-self-mod-propose', 'heart-self-mod', 'heart', 'Proposals', ARRAY['propose', 'suggest', 'recommend', 'change'], 100),
+  ('heart-security-scan', 'heart-security', 'heart', 'Security Scan', ARRAY['scan', 'vulnerability', 'audit'], 100)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- SEED DATA: System AI Stacks (Shared)
+-- ============================================================================
+
+INSERT INTO ai_stacks (id, node_id, ai_type, name, keywords, priority) VALUES
+  ('system-health-core', 'system-health', 'system', 'Core Health', ARRAY['cpu', 'memory', 'disk', 'network'], 100),
+  ('system-health-database', 'system-health', 'system', 'Database Health', ARRAY['postgres', 'connection', 'pool', 'query'], 95),
+  ('system-health-services', 'system-health', 'system', 'Services Health', ARRAY['service', 'process', 'uptime', 'running'], 90),
+  ('system-heal-auto', 'system-auto-heal', 'system', 'Auto Heal', ARRAY['heal', 'fix', 'recover', 'restart'], 100),
+  ('system-heal-rollback', 'system-auto-heal', 'system', 'Rollback', ARRAY['rollback', 'revert', 'restore', 'backup'], 95),
+  ('system-mem-compress', 'system-memory-mgmt', 'system', 'Compression', ARRAY['compress', 'tier', 'archive', 'shrink'], 100),
+  ('system-mem-cleanup', 'system-memory-mgmt', 'system', 'Cleanup', ARRAY['cleanup', 'expire', 'delete', 'purge'], 95),
+  ('system-sched-jobs', 'system-scheduler', 'system', 'Jobs', ARRAY['job', 'task', 'queue', 'worker'], 100),
+  ('system-diag-check', 'system-diagnostics', 'system', 'Diagnostics', ARRAY['diagnose', 'check', 'test', 'verify'], 100)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- SEED DATA: Brain AI Domains
+-- ============================================================================
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+  ('brain-dom-chat', 'brain-general-conversation', 'brain-general', 'brain', 'Chat', ARRAY['chat', 'talk', 'hi', 'hello'], 100),
+  ('brain-dom-explain', 'brain-general-qa', 'brain-general', 'brain', 'Explain', ARRAY['explain', 'what', 'why', 'how'], 95),
+  ('brain-dom-stress', 'brain-eng-mechanical', 'brain-engineering', 'brain', 'Stress Analysis', ARRAY['stress', 'strain', 'fatigue', 'yield'], 100),
+  ('brain-dom-dynamics', 'brain-eng-mechanical', 'brain-engineering', 'brain', 'Dynamics', ARRAY['dynamics', 'vibration', 'motion', 'force'], 95),
+  ('brain-dom-fluids', 'brain-eng-mechanical', 'brain-engineering', 'brain', 'Fluids', ARRAY['fluid', 'flow', 'pressure', 'pump', 'pipe'], 90),
+  ('brain-dom-circuits', 'brain-eng-electrical', 'brain-engineering', 'brain', 'Circuits', ARRAY['circuit', 'pcb', 'schematic', 'component'], 100),
+  ('brain-dom-power', 'brain-eng-electrical', 'brain-engineering', 'brain', 'Power', ARRAY['power', 'voltage', 'transformer', 'generator'], 95),
+  ('brain-dom-slurry', 'brain-eng-process', 'brain-engineering', 'brain', 'Slurry', ARRAY['slurry', 'wear', 'liner', 'abrasion'], 100),
+  ('brain-dom-mining', 'brain-eng-process', 'brain-engineering', 'brain', 'Mining', ARRAY['mining', 'ore', 'mill', 'screen', 'cyclone'], 95),
+  ('brain-dom-docs', 'brain-creative-writing', 'brain-creative', 'brain', 'Documentation', ARRAY['document', 'report', 'write', 'draft'], 100),
+  ('brain-dom-blueprint', 'brain-creative-blueprint', 'brain-creative', 'brain', 'Blueprint', ARRAY['blueprint', 'spec', 'design', 'plan'], 100)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- SEED DATA: Heart AI Domains (Shared)
+-- ============================================================================
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+  ('heart-dom-ts-types', 'heart-repair-typescript', 'heart-code-repair', 'heart', 'TS Types', ARRAY['type', 'interface', 'generic', 'enum'], 100),
+  ('heart-dom-ts-async', 'heart-repair-typescript', 'heart-code-repair', 'heart', 'Async', ARRAY['async', 'await', 'promise', 'callback'], 95),
+  ('heart-dom-react-hooks', 'heart-repair-react', 'heart-code-repair', 'heart', 'Hooks', ARRAY['hook', 'useState', 'useEffect', 'useMemo'], 100),
+  ('heart-dom-react-comp', 'heart-repair-react', 'heart-code-repair', 'heart', 'Components', ARRAY['component', 'props', 'render', 'jsx'], 95),
+  ('heart-dom-node-api', 'heart-repair-node', 'heart-code-repair', 'heart', 'API', ARRAY['api', 'route', 'endpoint', 'handler'], 100),
+  ('heart-dom-node-express', 'heart-repair-node', 'heart-code-repair', 'heart', 'Express', ARRAY['express', 'middleware', 'router'], 95),
+  ('heart-dom-sql', 'heart-repair-database', 'heart-code-repair', 'heart', 'SQL', ARRAY['sql', 'query', 'select', 'join', 'index'], 100),
+  ('heart-dom-drizzle', 'heart-repair-database', 'heart-code-repair', 'heart', 'Drizzle', ARRAY['drizzle', 'schema', 'migration'], 95),
+  ('heart-dom-perf-speed', 'heart-optimize-perf', 'heart-code-optimize', 'heart', 'Speed', ARRAY['speed', 'slow', 'fast', 'optimize'], 100),
+  ('heart-dom-ai-latency', 'heart-ai-monitor', 'heart-ai-health', 'heart', 'AI Latency', ARRAY['latency', 'slow', 'timeout', 'response'], 100),
+  ('heart-dom-security', 'heart-security-scan', 'heart-security', 'heart', 'Security', ARRAY['security', 'vulnerability', 'xss', 'injection'], 100)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- SEED DATA: System AI Domains (Shared)
+-- ============================================================================
+
+INSERT INTO ai_domains (id, stack_id, node_id, ai_type, name, keywords, priority) VALUES
+  ('system-dom-cpu', 'system-health-core', 'system-health', 'system', 'CPU', ARRAY['cpu', 'processor', 'load', 'usage'], 100),
+  ('system-dom-memory', 'system-health-core', 'system-health', 'system', 'Memory', ARRAY['memory', 'ram', 'heap', 'usage'], 95),
+  ('system-dom-disk', 'system-health-core', 'system-health', 'system', 'Disk', ARRAY['disk', 'storage', 'space', 'full'], 90),
+  ('system-dom-db-pool', 'system-health-database', 'system-health', 'system', 'DB Pool', ARRAY['pool', 'connection', 'postgres'], 100),
+  ('system-dom-db-query', 'system-health-database', 'system-health', 'system', 'DB Query', ARRAY['query', 'slow', 'timeout'], 95),
+  ('system-dom-heal-db', 'system-heal-auto', 'system-auto-heal', 'system', 'Heal DB', ARRAY['heal', 'database', 'connection'], 100),
+  ('system-dom-heal-cache', 'system-heal-auto', 'system-auto-heal', 'system', 'Heal Cache', ARRAY['heal', 'cache', 'clear', 'redis'], 95),
+  ('system-dom-heal-restart', 'system-heal-auto', 'system-auto-heal', 'system', 'Restart', ARRAY['restart', 'reboot', 'recover'], 90),
+  ('system-dom-compress', 'system-mem-compress', 'system-memory-mgmt', 'system', 'Compress', ARRAY['compress', 'tier', 'archive'], 100),
+  ('system-dom-cleanup', 'system-mem-cleanup', 'system-memory-mgmt', 'system', 'Cleanup', ARRAY['cleanup', 'expire', 'delete', 'purge'], 100),
+  ('system-dom-jobs', 'system-sched-jobs', 'system-scheduler', 'system', 'Jobs', ARRAY['job', 'task', 'queue', 'cron'], 100),
+  ('system-dom-diag', 'system-diag-check', 'system-diagnostics', 'system', 'Diagnostics', ARRAY['diagnose', 'check', 'test'], 100)
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================================
+-- SEED DATA: Default Model Configuration
+-- ============================================================================
+
+-- Brain AI Models
+INSERT INTO ai_model_config (id, ai_type, model_slot, provider, model_name, is_primary, priority, max_tokens, temperature) VALUES
+  ('brain-m1-primary', 'brain', 1, 'openrouter', 'deepseek/deepseek-chat', TRUE, 100, 1000, 0.7),
+  ('brain-m1-backup', 'brain', 1, 'openrouter', 'anthropic/claude-3.5-sonnet:beta', FALSE, 90, 1000, 0.7),
+  ('brain-m2-primary', 'brain', 2, 'github', 'gpt-4o-mini', TRUE, 100, 1000, 0.7),
+  ('brain-m2-backup', 'brain', 2, 'openrouter', 'google/gemini-2.0-flash-001:free', FALSE, 90, 1000, 0.7),
+  ('brain-m3-primary', 'brain', 3, 'openrouter', 'anthropic/claude-3-haiku:beta', TRUE, 100, 1000, 0.7),
+  ('brain-m3-backup', 'brain', 3, 'openrouter', 'deepseek/deepseek-r1:free', FALSE, 90, 1000, 0.7)
+ON CONFLICT (id) DO NOTHING;
+
+-- Heart AI Models
+INSERT INTO ai_model_config (id, ai_type, model_slot, provider, model_name, is_primary, priority, max_tokens, temperature) VALUES
+  ('heart-m1-primary', 'heart', 1, 'openrouter', 'deepseek/deepseek-chat', TRUE, 100, 1200, 0.3),
+  ('heart-m1-backup', 'heart', 1, 'openrouter', 'anthropic/claude-3.5-sonnet:beta', FALSE, 90, 1200, 0.3),
+  ('heart-m2-primary', 'heart', 2, 'openrouter', 'meta-llama/llama-3.3-70b-instruct:free', TRUE, 100, 1200, 0.3),
+  ('heart-m2-backup', 'heart', 2, 'openrouter', 'deepseek/deepseek-r1:free', FALSE, 90, 1200, 0.3),
+  ('heart-m3-primary', 'heart', 3, 'openrouter', 'anthropic/claude-3-haiku:beta', TRUE, 100, 1200, 0.3),
+  ('heart-m3-backup', 'heart', 3, 'github', 'gpt-4o-mini', FALSE, 90, 1200, 0.3)
+ON CONFLICT (id) DO NOTHING;
+
+-- System AI Models
+INSERT INTO ai_model_config (id, ai_type, model_slot, provider, model_name, is_primary, priority, max_tokens, temperature) VALUES
+  ('system-m1-primary', 'system', 1, 'openrouter', 'deepseek/deepseek-r1:free', TRUE, 100, 800, 0.2),
+  ('system-m1-backup', 'system', 1, 'openrouter', 'meta-llama/llama-3.3-70b-instruct:free', FALSE, 90, 800, 0.2),
+  ('system-m2-primary', 'system', 2, 'openrouter', 'anthropic/claude-3.5-sonnet:beta', TRUE, 100, 800, 0.2),
+  ('system-m2-backup', 'system', 2, 'openrouter', 'deepseek/deepseek-chat', FALSE, 90, 800, 0.2),
+  ('system-m3-primary', 'system', 3, 'github', 'gpt-4o-mini', TRUE, 100, 800, 0.2),
+  ('system-m3-backup', 'system', 3, 'openrouter', 'google/gemini-2.0-flash-001:free', FALSE, 90, 800, 0.2)
+ON CONFLICT (id) DO NOTHING;

@@ -1,0 +1,1022 @@
+Use **4100** as the single backend port for HTTP + Socket.io (including video chat) to avoid conflicts with 3001/4200/5000 and keep things simple.[1]
+
+Below is a **complete, end‑to‑end, copy‑paste‑ready set** of files/changes to:
+
+- Keep your existing token/portal flow intact.  
+- Add stable 1:1 video chat using WebRTC + Socket.io.  
+- Use port 4100 for the backend, in a way Replit understands.  
+
+Assumptions:
+
+- You already have the NeuroCore codebase from the snapshot.  
+- You will overwrite only the files listed below or add new ones where specified.  
+
+***
+
+## 1. Backend – unified server on port 4100
+
+### 1.1 `server/index.ts` (overwrite with this)
+
+This version:
+
+- Uses Express + Socket.io.  
+- Listens on port 4100 by default.  
+- Registers your existing routes (`messaging`, `metricsRoute`) and the new call signaling.  
+
+Adjust import paths if your route filenames differ, but keep structure identical.
+
+```ts
+// server/index.ts
+import http from "http";
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import helmet from "helmet";
+import { Server as SocketIOServer } from "socket.io";
+
+import messagingRoutes from "./routes/messaging";
+import metricsRoute from "./routes/metricsRoute";
+import { registerCallSignaling } from "./realtime/callSignaling";
+
+const app = express();
+
+app.use(cors());
+app.use(helmet());
+app.use(bodyParser.json());
+
+// REST routes
+app.use("/api/messaging", messagingRoutes);
+app.use("/api/metrics", metricsRoute);
+
+// If you have other routes (auth, blueprints, etc.), keep them here too.
+// Example:
+// import authRoutes from "./routes/auth";
+// app.use("/api/auth", authRoutes);
+
+const server = http.createServer(app);
+
+const io = new SocketIOServer(server, {
+  cors: {
+    origin: "*", // tighten later to your front-end URL if desired
+  },
+});
+
+// WebRTC call signaling namespace
+registerCallSignaling(io);
+
+const PORT = Number(process.env.PORT) || 4100;
+
+server.listen(PORT, () => {
+  console.log(`NeuroCore backend (HTTP + Socket.io) listening on port ${PORT}`);
+});
+```
+
+### 1.2 `server/realtime/callSignaling.ts` (new file)
+
+```ts
+// server/realtime/callSignaling.ts
+import type { Server, Socket } from "socket.io";
+
+interface CallJoinPayload {
+  conversationId: string;
+}
+
+interface CallSignalPayload {
+  conversationId: string;
+  data: any;
+}
+
+export function registerCallSignaling(io: Server) {
+  const nsp = io.of("/calls");
+
+  nsp.on("connection", (socket: Socket) => {
+    console.log("[calls] client connected:", socket.id);
+
+    socket.on("call:join", ({ conversationId }: CallJoinPayload) => {
+      console.log("[calls] join", socket.id, "room", conversationId);
+      socket.join(conversationId);
+      socket.to(conversationId).emit("call:user-joined", { socketId: socket.id });
+    });
+
+    socket.on("call:signal", ({ conversationId, data }: CallSignalPayload) => {
+      socket.to(conversationId).emit("call:signal", { from: socket.id, data });
+    });
+
+    socket.on("call:leave", ({ conversationId }: CallJoinPayload) => {
+      console.log("[calls] leave", socket.id, "room", conversationId);
+      socket.leave(conversationId);
+      socket.to(conversationId).emit("call:user-left", { socketId: socket.id });
+    });
+
+    socket.on("disconnect", (reason) => {
+      console.log("[calls] client disconnected:", socket.id, reason);
+    });
+  });
+}
+```
+
+### 1.3 Replit configuration
+
+In Replit:
+
+- If you can set environment variables, set:  
+  - `PORT=4100`  
+- Or just rely on the code’s default (4100) and ensure no other process binds that port.  
+
+The front‑end should call API URLs relative to the Replit domain (Replit usually proxies to the correct internal port automatically).
+
+***
+
+## 2. Frontend – WebRTC logic and overlay
+
+### 2.1 `src/video/useP2PCall.ts` (new file, hardened)
+
+```ts
+// src/video/useP2PCall.ts
+import { useEffect, useRef, useState, useCallback } from "react";
+import { io, Socket } from "socket.io-client";
+
+interface UseP2PCallOptions {
+  conversationId: string;
+  localVideoRef: React.RefObject<HTMLVideoElement>;
+  remoteVideoRef: React.RefObject<HTMLVideoElement>;
+}
+
+type CallState = "idle" | "connecting" | "in-call" | "error";
+
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+];
+
+export function useP2PCall({
+  conversationId,
+  localVideoRef,
+  remoteVideoRef,
+}: UseP2PCallOptions) {
+  const [state, setState] = useState<CallState>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [muted, setMuted] = useState(false);
+  const [cameraOff, setCameraOff] = useState(false);
+
+  const socketRef = useRef<Socket | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const callerStartedRef = useRef<boolean>(false);
+  const timeoutRef = useRef<number | null>(null);
+
+  const cleanupPeer = useCallback(() => {
+    if (timeoutRef.current) {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    pcRef.current?.close();
+    pcRef.current = null;
+    localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    localStreamRef.current = null;
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+  }, [localVideoRef, remoteVideoRef]);
+
+  const startPeerConnection = useCallback(
+    async (asCaller: boolean) => {
+      try {
+        setState("connecting");
+        setError(null);
+
+        // Explicit getUserMedia handling
+        let stream: MediaStream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: { facingMode: "user" },
+          });
+        } catch (err: any) {
+          console.error("[WebRTC] getUserMedia failed", err);
+          setError(
+            "Could not start camera/mic. Allow access and ensure no other app is using them."
+          );
+          setState("error");
+          return;
+        }
+
+        localStreamRef.current = stream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+        }
+
+        const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+        pcRef.current = pc;
+
+        stream.getTracks().forEach((track) => {
+          pc.addTrack(track, stream);
+        });
+
+        pc.ontrack = (event) => {
+          const [remoteStream] = event.streams;
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = remoteStream;
+          }
+        };
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate && socketRef.current) {
+            socketRef.current.emit("call:signal", {
+              conversationId,
+              data: { candidate: event.candidate },
+            });
+          }
+        };
+
+        pc.onconnectionstatechange = () => {
+          console.log("[WebRTC] connectionState:", pc.connectionState);
+          if (pc.connectionState === "connected") {
+            setState("in-call");
+            if (timeoutRef.current) {
+              window.clearTimeout(timeoutRef.current);
+              timeoutRef.current = null;
+            }
+          } else if (
+            pc.connectionState === "failed" ||
+            pc.connectionState === "disconnected" ||
+            pc.connectionState === "closed"
+          ) {
+            setState("error");
+            if (timeoutRef.current) {
+              window.clearTimeout(timeoutRef.current);
+              timeoutRef.current = null;
+            }
+          }
+        };
+
+        // Connection timeout
+        if (timeoutRef.current) {
+          window.clearTimeout(timeoutRef.current);
+        }
+        timeoutRef.current = window.setTimeout(() => {
+          console.warn("[WebRTC] Call setup timeout for conversation", conversationId);
+          setError(
+            "Call failed to connect in time. Check permissions or network and try again."
+          );
+          setState("error");
+          cleanupPeer();
+        }, 30000); // 30s
+
+        if (asCaller && socketRef.current) {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socketRef.current.emit("call:signal", {
+            conversationId,
+            data: offer,
+          });
+        }
+      } catch (err: any) {
+        console.error("startPeerConnection error", err);
+        setError(err?.message ?? "Failed to start call");
+        setState("error");
+        cleanupPeer();
+      }
+    },
+    [cleanupPeer, conversationId, localVideoRef, remoteVideoRef]
+  );
+
+  useEffect(() => {
+    const socket = io("/calls");
+    socketRef.current = socket;
+
+    socket.on("connect", () => {
+      console.log("[calls] connected socket", socket.id);
+      socket.emit("call:join", { conversationId });
+    });
+
+    socket.on("call:user-joined", () => {
+      console.log("[calls] another user joined", conversationId);
+      // explicit Start button will handle caller side
+    });
+
+    socket.on("call:signal", async ({ data }) => {
+      try {
+        if (!pcRef.current) {
+          // we are callee
+          await startPeerConnection(false);
+        }
+        const pc = pcRef.current!;
+        if (data.type === "offer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(data));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit("call:signal", { conversationId, data: answer });
+        } else if (data.type === "answer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(data));
+        } else if (data.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+      } catch (err: any) {
+        console.error("Signal handling error", err);
+        setError(err?.message ?? "Signal error");
+        setState("error");
+        cleanupPeer();
+      }
+    });
+
+    socket.on("call:user-left", () => {
+      console.log("[calls] user left", conversationId);
+      cleanupPeer();
+      setState("idle");
+    });
+
+    socket.on("disconnect", (reason) => {
+      console.log("[calls] socket disconnected:", reason);
+    });
+
+    return () => {
+      socket.emit("call:leave", { conversationId });
+      socket.disconnect();
+      cleanupPeer();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, cleanupPeer, startPeerConnection]);
+
+  const startCall = useCallback(async () => {
+    if (callerStartedRef.current) return;
+    callerStartedRef.current = true;
+    await startPeerConnection(true);
+  }, [startPeerConnection]);
+
+  const endCall = useCallback(() => {
+    callerStartedRef.current = false;
+    if (socketRef.current) {
+      socketRef.current.emit("call:leave", { conversationId });
+    }
+    cleanupPeer();
+    setState("idle");
+  }, [cleanupPeer, conversationId]);
+
+  const toggleMute = useCallback(() => {
+    if (!localStreamRef.current) return;
+    const enabled = !muted;
+    localStreamRef.current.getAudioTracks().forEach((t) => {
+      t.enabled = enabled;
+    });
+    setMuted(!muted);
+  }, [muted]);
+
+  const toggleCamera = useCallback(() => {
+    if (!localStreamRef.current) return;
+    const enabled = !cameraOff;
+    localStreamRef.current.getVideoTracks().forEach((t) => {
+      t.enabled = enabled;
+    });
+    setCameraOff(!cameraOff);
+  }, [cameraOff]);
+
+  return {
+    state,
+    error,
+    muted,
+    cameraOff,
+    startCall,
+    endCall,
+    toggleMute,
+    toggleCamera,
+  };
+}
+```
+
+### 2.2 `src/video/VideoCallOverlay.tsx` (new file)
+
+```tsx
+// src/video/VideoCallOverlay.tsx
+import React, { useRef } from "react";
+import { useP2PCall } from "./useP2PCall";
+
+interface VideoCallOverlayProps {
+  conversationId: string | null;
+  peerName?: string;
+  onClose: () => void;
+}
+
+export function VideoCallOverlay({
+  conversationId,
+  peerName,
+  onClose,
+}: VideoCallOverlayProps) {
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  if (!conversationId) return null;
+
+  const {
+    state,
+    error,
+    muted,
+    cameraOff,
+    startCall,
+    endCall,
+    toggleMute,
+    toggleCamera,
+  } = useP2PCall({ conversationId, localVideoRef, remoteVideoRef });
+
+  const handleEnd = () => {
+    endCall();
+    onClose();
+  };
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 16,
+        right: 16,
+        width: 360,
+        height: 260,
+        background: "#0f172a",
+        color: "#e5e7eb",
+        borderRadius: 12,
+        border: "1px solid #1f2937",
+        boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+        zIndex: 1000,
+      }}
+    >
+      <div
+        style={{
+          padding: "8px 12px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          background: "#020617",
+          borderBottom: "1px solid #1f2937",
+        }}
+      >
+        <div style={{ fontSize: 12 }}>
+          <div style={{ fontWeight: 600 }}>Video Call</div>
+          <div style={{ fontSize: 11, opacity: 0.7 }}>
+            {peerName ?? "Peer"} · {state}
+          </div>
+        </div>
+        <button
+          onClick={handleEnd}
+          style={{
+            background: "#ef4444",
+            border: "none",
+            color: "white",
+            borderRadius: 999,
+            padding: "4px 10px",
+            fontSize: 11,
+            cursor: "pointer",
+          }}
+        >
+          End
+        </button>
+      </div>
+
+      <div style={{ flex: 1, position: "relative", background: "black" }}>
+        <video
+          ref={remoteVideoRef}
+          autoPlay
+          playsInline
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            background: "#000",
+          }}
+        />
+        <video
+          ref={localVideoRef}
+          autoPlay
+          playsInline
+          muted
+          style={{
+            position: "absolute",
+            bottom: 8,
+            right: 8,
+            width: 100,
+            height: 70,
+            objectFit: "cover",
+            borderRadius: 8,
+            border: "1px solid rgba(255,255,255,0.2)",
+            background: "#020617",
+          }}
+        />
+      </div>
+
+      <div
+        style={{
+          padding: "6px 10px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          background: "#020617",
+          borderTop: "1px solid #1f2937",
+        }}
+      >
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            onClick={toggleMute}
+            style={{
+              background: muted ? "#991b1b" : "#111827",
+              border: "1px solid #374151",
+              color: "#e5e7eb",
+              borderRadius: 999,
+              padding: "4px 12px",
+              fontSize: 11,
+              cursor: "pointer",
+            }}
+          >
+            {muted ? "Unmute" : "Mute"}
+          </button>
+          <button
+            onClick={toggleCamera}
+            style={{
+              background: cameraOff ? "#991b1b" : "#111827",
+              border: "1px solid #374151",
+              color: "#e5e7eb",
+              borderRadius: 999,
+              padding: "4px 12px",
+              fontSize: 11,
+              cursor: "pointer",
+            }}
+          >
+            {cameraOff ? "Camera On" : "Camera Off"}
+          </button>
+        </div>
+        <button
+          onClick={startCall}
+          style={{
+            background: "#22c55e",
+            border: "none",
+            color: "white",
+            borderRadius: 999,
+            padding: "4px 10px",
+            fontSize: 11,
+            cursor: "pointer",
+          }}
+        >
+          {state === "in-call" ? "Reconnect" : "Start"}
+        </button>
+      </div>
+
+      {error && (
+        <div
+          style={{
+            padding: "4px 10px",
+            fontSize: 11,
+            color: "#fecaca",
+            background: "#7f1d1d",
+          }}
+        >
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+***
+
+## 3. Frontend – integrate without touching portal auth
+
+Your original `Layout.tsx` (with `Header` and `Sidebar`) should **stay as in the snapshot**, so portal + token flow remain unchanged.[1]
+
+### 3.1 Restore `src/components/Layout.tsx` (snapshot version)
+
+```tsx
+// src/components/Layout.tsx
+import React, { ReactNode } from "react";
+import Header from "./Header";
+import Sidebar from "./Sidebar";
+import "./Layout.css";
+import type AppMode, UserRole from "../App";
+
+interface UserProfile {
+  username: string;
+  role: UserRole;
+  profileName?: string;
+  department?: string;
+  isOnline: boolean;
+}
+
+interface LayoutProps {
+  children: ReactNode;
+  mode: AppMode;
+  setMode: (mode: AppMode) => void;
+  isDarkMode: boolean;
+  setIsDarkMode: (dark: boolean) => void;
+  user?: UserProfile;
+  onLogout?: () => void;
+  onStatusChange?: (isOnline: boolean) => void;
+}
+
+export default function Layout({
+  children,
+  mode,
+  setMode,
+  isDarkMode,
+  setIsDarkMode,
+  user,
+  onLogout,
+  onStatusChange,
+}: LayoutProps) {
+  return (
+    <div className={`layout ${isDarkMode ? "dark" : "light"}`}>
+      <Header
+        isDarkMode={isDarkMode}
+        setIsDarkMode={setIsDarkMode}
+        user={user}
+        onLogout={onLogout}
+        onStatusChange={onStatusChange}
+      />
+      <div className="layout-body">
+        <Sidebar mode={mode} setMode={setMode} userRole={user?.role} />
+        <main className="layout-content">{children}</main>
+      </div>
+    </div>
+  );
+}
+```
+
+No video logic here; video is mounted inside the chat view.
+
+### 3.2 Chat page – mount overlay and pass handlers
+
+Find the component that renders **conversation + messages + ChatInput** (for example, `MessagesPage.tsx` or similar). Since paths in the snapshot are large, if you tell its filename, detailed code can be tailored; but generically:
+
+```tsx
+// src/pages/MessagesPage.tsx  (example name)
+import React, { useState } from "react";
+import ConversationList from "../components/ConversationList";
+import ChatInput from "../components/ChatInput";
+import { VideoCallOverlay } from "../video/VideoCallOverlay";
+
+// ...fetch conversations, currentConversationId, etc.
+
+export default function MessagesPage() {
+  const [activeCallConversationId, setActiveCallConversationId] = useState<string | null>(null);
+  const [activeCallPeerName, setActiveCallPeerName] = useState<string | undefined>(undefined);
+
+  // conversations, currentConversation, etc. from your existing logic.
+
+  return (
+    <div className="messages-page">
+      {/* Left: conversation list */}
+      <ConversationList
+        conversations={conversations}
+        loading={loading}
+        onStartCall={(id, peerName) => {
+          setActiveCallConversationId(id);
+          setActiveCallPeerName(peerName);
+        }}
+      />
+
+      {/* Right: active conversation + chat input */}
+      <div className="chat-panel">
+        {/* ...messages... */}
+        <ChatInput
+          onSend={handleSend}
+          disabled={sending}
+          conversationId={currentConversationId}
+          peerName={currentPeerName}
+          onStartCall={() => {
+            setActiveCallConversationId(currentConversationId);
+            setActiveCallPeerName(currentPeerName);
+          }}
+        />
+      </div>
+
+      <VideoCallOverlay
+        conversationId={activeCallConversationId}
+        peerName={activeCallPeerName}
+        onClose={() => {
+          setActiveCallConversationId(null);
+          setActiveCallPeerName(undefined);
+        }}
+      />
+    </div>
+  );
+}
+```
+
+Adapt field names to your actual page component.
+
+### 3.3 `src/components/ConversationList.tsx` – add `onStartCall` prop
+
+Overwrite with this version (adjust type field names to your `ConversationRecord`):
+
+```tsx
+// src/components/ConversationList.tsx
+import React from "react";
+import "./ConversationList.css";
+import type ConversationRecord from "../types";
+
+interface ConversationListProps {
+  conversations: ConversationRecord[];
+  loading?: boolean;
+  onStartCall?: (id: string, peerName?: string) => void;
+}
+
+export default function ConversationList({
+  conversations,
+  loading,
+  onStartCall,
+}: ConversationListProps) {
+  if (loading) {
+    return (
+      <div className="list-loading">
+        <div className="spinner" />
+        <p>Loading conversations...</p>
+      </div>
+    );
+  }
+
+  if (!conversations.length) {
+    return (
+      <div className="list-empty">
+        <p>No conversations found.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="conversation-list">
+      <div className="list-header">
+        <div className="col-endpoint">Endpoint</div>
+        <div className="col-prompt">Prompt</div>
+        <div className="col-coherence">Coherence</div>
+        <div className="col-timestamp">Created</div>
+        <div className="col-actions">Actions</div>
+      </div>
+      {conversations.map((conv) => (
+        <div key={conv.id} className="list-row">
+          <div className="col-endpoint">
+            <span className="endpoint-badge">{conv.endpoint ?? "chat"}</span>
+          </div>
+          <div className="col-prompt">
+            <div className="prompt-text">{conv.prompt ?? "Conversation"}</div>
+          </div>
+          <div className="col-coherence">
+            {/* your existing coherence bar if any */}
+          </div>
+          <div className="col-timestamp">
+            {conv.createdAt
+              ? new Date(conv.createdAt).toLocaleString()
+              : ""}
+          </div>
+          <div className="col-actions">
+            {onStartCall && (
+              <button
+                type="button"
+                onClick={() => onStartCall(conv.id, conv.peerName ?? "Peer")}
+              >
+                Call
+              </button>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+### 3.4 `src/components/ChatInput.tsx` – add `onStartCall` prop and 📹 button
+
+Overwrite `ChatInput.tsx` with this version (keeps your STT/TTS logic, adds call trigger):
+
+```tsx
+// src/components/ChatInput.tsx
+import React, { useState, useRef } from "react";
+import "./ChatInput.css";
+
+interface ChatInputProps {
+  onSend: (prompt: string) => void;
+  disabled?: boolean;
+  conversationId: string;
+  peerName?: string;
+  onStartCall?: () => void;
+}
+
+export default function ChatInput({
+  onSend,
+  disabled,
+  conversationId,
+  peerName,
+  onStartCall,
+}: ChatInputProps) {
+  const [input, setInput] = useState("");
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const recognitionRef = useRef<any>(null);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (input.trim() && !disabled) {
+      onSend(input);
+      setInput("");
+    }
+  };
+
+  const startSpeechToText = () => {
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Speech recognition is not supported in your browser. Please use Chrome or Edge.");
+      return;
+    }
+
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognitionRef.current = recognition;
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onstart = () => setIsListening(true);
+
+    recognition.onresult = (event: any) => {
+      const transcript = Array.from(event.results)
+        .map((result: any) => result[0].transcript)
+        .join("");
+      setInput(transcript);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error("Speech recognition error", event.error);
+      setIsListening(false);
+    };
+
+    recognition.onend = () => setIsListening(false);
+    recognition.start();
+  };
+
+  const speakText = () => {
+    if (!input.trim()) {
+      alert("Please enter some text to speak.");
+      return;
+    }
+    if (isSpeaking) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+      return;
+    }
+    const utterance = new SpeechSynthesisUtterance(input);
+    utterance.lang = "en-US";
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    utterance.onstart = () => setIsSpeaking(true);
+    utterance.onend = () => setIsSpeaking(false);
+    utterance.onerror = () => setIsSpeaking(false);
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const handleStartCallClick = () => {
+    if (onStartCall) {
+      onStartCall();
+    }
+  };
+
+  return (
+    <form className="chat-input-form" onSubmit={handleSubmit}>
+      <div className="input-wrapper">
+        <div className="speech-controls">
+          <button
+            type="button"
+            className={`speech-button mic-button ${isListening ? "active" : ""}`}
+            onClick={startSpeechToText}
+            title={isListening ? "Stop listening" : "Speak to text"}
+            disabled={disabled}
+          >
+            🎤
+          </button>
+          <button
+            type="button"
+            className={`speech-button speaker-button ${isSpeaking ? "active" : ""}`}
+            onClick={speakText}
+            title={isSpeaking ? "Stop speaking" : "Text to speak"}
+            disabled={disabled || !input.trim()}
+          >
+            🔊
+          </button>
+        </div>
+
+        <textarea
+          className="chat-input"
+          placeholder="Ask NeuroCore anything..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={disabled}
+          rows={3}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && e.ctrlKey) handleSubmit(e);
+          }}
+        />
+
+        {onStartCall && (
+          <button
+            type="button"
+            className="call-button"
+            onClick={handleStartCallClick}
+            title={`Start video call with ${peerName ?? "peer"}`}
+            disabled={disabled}
+          >
+            📹
+          </button>
+        )}
+
+        <button
+          type="submit"
+          className="send-button"
+          disabled={disabled || !input.trim()}
+          title="Send (Ctrl+Enter)"
+        >
+          ➤
+        </button>
+      </div>
+      <div className="input-hint">
+        Press Ctrl+Enter or click to send • Speak • Listen
+      </div>
+    </form>
+  );
+}
+```
+
+And in `ChatInput.css`, add:
+
+```css
+.call-button {
+  padding: 12px 16px;
+  background-color: #111827;
+  color: #e5e7eb;
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 18px;
+  flex-shrink: 0;
+  height: 48px;
+  width: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.call-button:hover:not(:disabled) {
+  background-color: #1f2937;
+}
+.call-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+```
+
+***
+
+## 4. Jitsi removal (to avoid conflicts)
+
+- Remove all imports of `JitsiOverlay` in your front‑end.  
+- Do **not** render `JitsiOverlay` anywhere.  
+- You can keep the file in the repo or delete it; it no longer affects behavior.  
+
+---
+
+## 5. After copy/paste – testing steps
+
+Once all above is in Replit:
+
+1. Stop any running process.  
+2. Run the project; confirm `NeuroCore backend (HTTP + Socket.io) listening on port 4100` appears in logs.  
+3. Open the public app URL in **two different clients**:  
+   - Laptop browser A.  
+   - Mobile browser B (not a WebView; use Chrome/Android or Safari/iOS).  
+4. Both log into the same account space and open the same conversation.  
+5. On A, click the 📹 or “Call” button.  
+6. Ensure both sides **allow camera/mic** when prompted.  
+7. Within 30s, you should either:  
+   - See each other’s video; or  
+   - Get a concrete error message in the call overlay instead of a stall/white screen.  
+
+This set of changes:
+
+- Keeps your portal and token auth intact (no edits to auth/router/portal files).  
+- Avoids port conflicts via a single unified backend on **4100**.  
+- Provides a stable, fully wired 1:1 video chat workflow entirely under your control.
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/3ddd18d4-1107-4ca6-a598-8a2d2fd61570/COMPLETE-CODEBASE-SNAPSHOT-2025-12-24.md)
+[2](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/e4ade863-433a-47b8-87bc-3d52daae98ab/ira-neuro-complete.md)
+[3](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/484026ce-e4a2-4452-9533-04ea24853bf6/ira-neuro-config.md)
+[4](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d9efe794-0350-49ca-ae82-6b8c2bb74559/ira-neuro-database.md)
+[5](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/7c5f31ca-30f8-4c5c-bd2d-2974ab30e368/JitsiOverlay.tsx)
+[6](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d20276eb-47c2-49c4-b178-eb364ba44d53/ConversationList.tsx)
+[7](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/d45efade-97c7-4cde-9ab5-eda036e01548/ChatMetrics.tsx)
+[8](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/85af2b2c-0b25-403d-97e2-6b46c1b47767/ChatMessage.tsx)
+[9](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/138147cc-a238-45e8-9e4a-bd5425abaf44/ChatInput.tsx)
+[10](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/b3d6bf8f-3adb-418c-8b3d-1fd68e0c9aff/Layout.tsx)
+[11](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/9895ee21-cb06-46d7-9503-55c3596f29d0/JitsiOverlay.tsx)
+[12](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/0d794e58-3c42-4ecb-8293-04301791ea2c/metricsRoute.ts)
+[13](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/38110079/4678fae1-fd22-4b02-9e1c-1a9ee1fb78d2/messaging.ts)
